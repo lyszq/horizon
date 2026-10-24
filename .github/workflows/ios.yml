@@ -3,8 +3,6 @@ name: iOS package
 on:
   push:
     branches: [main, ios/ipad]
-  pull_request:
-    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -47,6 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ios-arm64-v1
+          cache-on-failure: true
           workspaces: ". -> target"
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/ios/ipad' }}
 

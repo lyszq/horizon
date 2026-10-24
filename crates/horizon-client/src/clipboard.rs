@@ -135,21 +135,23 @@ impl SystemClipboard {
 impl Clipboard for SystemClipboard {
     fn get(&mut self) -> String {
         #[cfg(target_os = "ios")]
-        { return horizon_ios_platform::clipboard_get(); }
+        {
+            return horizon_ios_platform::clipboard_get();
+        }
         #[cfg(not(target_os = "ios"))]
         {
-        let Some(system) = self.system() else {
-            return self.copied.clone().unwrap_or_default();
-        };
-        match system.get_text() {
-            Ok(text) => text,
-            Err(arboard::Error::ContentNotAvailable) => String::new(),
-            Err(_) => {
-                // A lost connection (a restarted compositor): reconnect next time.
-                self.system = None;
-                String::new()
+            let Some(system) = self.system() else {
+                return self.copied.clone().unwrap_or_default();
+            };
+            match system.get_text() {
+                Ok(text) => text,
+                Err(arboard::Error::ContentNotAvailable) => String::new(),
+                Err(_) => {
+                    // A lost connection (a restarted compositor): reconnect next time.
+                    self.system = None;
+                    String::new()
+                }
             }
-        }
         }
     }
     fn set(&mut self, text: &str) {

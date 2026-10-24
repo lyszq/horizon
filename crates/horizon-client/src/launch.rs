@@ -60,11 +60,16 @@ impl LaunchConfig {
     /// Defaults only: an existing player's options always win.
     pub fn initialize_options(&self) -> std::io::Result<()> {
         use std::io::Write;
-        match std::fs::OpenOptions::new().write(true).create_new(true)
-            .open(self.paths.home.join("options.txt")) {
-            Ok(mut file) => write!(file,
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.paths.home.join("options.txt"))
+        {
+            Ok(mut file) => write!(
+                file,
                 "renderDistance:{}\nsimulationDistance:{}\nmaxFps:{}\nenableVsync:true\n",
-                self.render_distance, self.simulation_distance, self.fps_limit),
+                self.render_distance, self.simulation_distance, self.fps_limit
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }

@@ -6,7 +6,12 @@ use serde_json::{Value, json};
 impl Pads {
     pub(super) fn read(&mut self) -> PadState {
         let state = horizon_ios_platform::controller();
-        PadState { buttons: state.buttons, left: state.left, right: state.right, triggers: state.triggers }
+        PadState {
+            buttons: state.buttons,
+            left: state.left,
+            right: state.right,
+            triggers: state.triggers,
+        }
     }
 }
 impl Game<'_> {

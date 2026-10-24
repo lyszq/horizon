@@ -1,10 +1,5 @@
 //! The playable game loop: streaming world, player simulation at 20 ticks/s,
 //! block interaction, inventory and HUD.
-mod touch;
-#[cfg(target_os = "ios")]
-mod mobile;
-#[cfg(target_os = "ios")]
-mod mobile_text;
 mod advancements;
 mod advancements_screen;
 mod agent;
@@ -98,6 +93,10 @@ mod maps;
 mod minecarts;
 mod mob_blocks;
 mod mob_gear;
+#[cfg(target_os = "ios")]
+mod mobile;
+#[cfg(target_os = "ios")]
+mod mobile_text;
 mod mods;
 mod mount_menu;
 mod mounts;
@@ -161,6 +160,7 @@ mod sulfur_cubes;
 mod titles;
 mod tnt;
 mod totem;
+mod touch;
 mod trading;
 mod trial_spawner;
 mod trial_visuals;
@@ -4094,7 +4094,10 @@ impl Game<'_> {
         let camera_eye = self.camera_eye_height();
         let pad = self.pad_move().unwrap_or([0.0; 2]);
         let touch = self.touch.movement_vector();
-        let combined = [(pad[0] + touch[0]).clamp(-1.0, 1.0), (pad[1] + touch[1]).clamp(-1.0, 1.0)];
+        let combined = [
+            (pad[0] + touch[0]).clamp(-1.0, 1.0),
+            (pad[1] + touch[1]).clamp(-1.0, 1.0),
+        ];
         let stick = (combined != [0.0; 2]).then_some(combined);
         if self.riding.is_some() && self.player.is_some() {
             let playing = self.screen == Screen::Playing;
@@ -4600,7 +4603,9 @@ impl Game<'_> {
         #[cfg(target_os = "ios")]
         {
             self.captured = capture && self.focused;
-            if !capture { self.stop_mining(); }
+            if !capture {
+                self.stop_mining();
+            }
             return;
         }
         // MouseHandler.grabMouse never captures an inactive window.
@@ -10787,15 +10792,25 @@ impl ApplicationHandler for Game<'_> {
             return;
         }
         #[cfg(target_os = "ios")]
-        if self.mobile.suspended && matches!(event, WindowEvent::RedrawRequested) { return; }
+        if self.mobile.suspended && matches!(event, WindowEvent::RedrawRequested) {
+            return;
+        }
         if let WindowEvent::Touch(touch) = &event {
-            if let Err(error) = self.touch_input(event_loop, touch.id, touch.phase, touch.location.x, touch.location.y) {
+            if let Err(error) = self.touch_input(
+                event_loop,
+                touch.id,
+                touch.phase,
+                touch.location.x,
+                touch.location.y,
+            ) {
                 log::warn!("Horizon touch: {error}");
             }
             return;
         }
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::Resized(_)) {
-            if let Err(error) = self.cancel_touch_input(event_loop) { log::warn!("Horizon touch release: {error}"); }
+            if let Err(error) = self.cancel_touch_input(event_loop) {
+                log::warn!("Horizon touch release: {error}");
+            }
         }
 
         if let WindowEvent::KeyboardInput { event, .. } = &event
@@ -12945,7 +12960,13 @@ impl Loading {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "ios")]
         {
-            if self.mobile_suspended { if let Some(r) = &mut self.renderer { if let Err(e) = r.recreate_surface() { self.error = Some(e); } } }
+            if self.mobile_suspended {
+                if let Some(r) = &mut self.renderer {
+                    if let Err(e) = r.recreate_surface() {
+                        self.error = Some(e);
+                    }
+                }
+            }
             self.mobile_suspended = false;
         }
         if self.window.is_some() {
@@ -13008,7 +13029,10 @@ impl Loading {
         }
         #[cfg(target_os = "ios")]
         if let WindowEvent::Touch(touch) = &event {
-            if let Err(error) = self.mobile_touch(event_loop, touch) { self.error = Some(error); event_loop.exit(); }
+            if let Err(error) = self.mobile_touch(event_loop, touch) {
+                self.error = Some(error);
+                event_loop.exit();
+            }
             return;
         }
         if let Err(error) = self.menu_event(event_loop, event) {
@@ -13053,8 +13077,15 @@ impl Loading {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "ios")]
         {
-            if self.mobile_suspended { event_loop.set_control_flow(ControlFlow::Wait); return; }
-            if let Err(error) = mobile::poll_loading(self) { self.error = Some(error); event_loop.exit(); return; }
+            if self.mobile_suspended {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
+            if let Err(error) = mobile::poll_loading(self) {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
         }
         if let Err(error) = self.poll_menu_resources() {
             self.error = Some(error);
@@ -13191,7 +13222,9 @@ impl ApplicationHandler for App {
             App::Setup(setup) => setup.suspend(),
             App::Loading(loading) => {
                 loading.mobile_suspended = true;
-                if let Some(r) = &mut loading.renderer { r.release_surface(); }
+                if let Some(r) = &mut loading.renderer {
+                    r.release_surface();
+                }
             }
             App::Ready(game) => game.mobile_suspend(event_loop),
         }
@@ -13199,8 +13232,12 @@ impl ApplicationHandler for App {
     #[cfg(target_os = "ios")]
     fn memory_warning(&mut self, _: &ActiveEventLoop) {
         match self {
-            App::Setup(_) => {},
-            App::Loading(loading) => { if let Some(r) = &mut loading.renderer { r.trim_unused_memory(); } },
+            App::Setup(_) => {}
+            App::Loading(loading) => {
+                if let Some(r) = &mut loading.renderer {
+                    r.trim_unused_memory();
+                }
+            }
             App::Ready(game) => game.mobile_memory_warning(),
         }
     }
@@ -13229,7 +13266,9 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "ios")]
         if let App::Setup(setup) = self {
-            if let Some(loading) = setup.poll(event_loop) { *self = App::Loading(Box::new(loading)); }
+            if let Some(loading) = setup.poll(event_loop) {
+                *self = App::Loading(Box::new(loading));
+            }
             return;
         }
         enum Step {
@@ -13321,12 +13360,24 @@ fn make_loading(
     };
     Ok(loading)
 }
-fn run_loading(options: Options, settings: Settings, vanilla_root: PathBuf, pack_error: Option<String>, started: Instant) -> Result<()> {
-    let mut app = App::Loading(Box::new(make_loading(options, settings, vanilla_root, pack_error, started)?));
+fn run_loading(
+    options: Options,
+    settings: Settings,
+    vanilla_root: PathBuf,
+    pack_error: Option<String>,
+    started: Instant,
+) -> Result<()> {
+    let mut app = App::Loading(Box::new(make_loading(
+        options,
+        settings,
+        vanilla_root,
+        pack_error,
+        started,
+    )?));
     EventLoop::new()?.run_app(&mut app)?;
     match app {
         #[cfg(target_os = "ios")]
-        App::Setup(_) => {},
+        App::Setup(_) => {}
         App::Ready(mut game) => {
             write_report(&game)?;
             if let Some(e) = game.error.take() {
@@ -13675,7 +13726,9 @@ fn mobile_touch_controls() -> horizon_client::touch::TouchControls {
     let mut controls = horizon_client::touch::TouchControls::default();
     #[cfg(target_os = "ios")]
     if let Ok(text) = std::fs::read_to_string("horizon-touch.json") {
-        if let Ok(layout) = horizon_client::touch::TouchLayout::from_json(&text) { controls.set_layout(layout); }
+        if let Ok(layout) = horizon_client::touch::TouchLayout::from_json(&text) {
+            controls.set_layout(layout);
+        }
     }
     controls.set_enabled(cfg!(target_os = "ios"));
     controls

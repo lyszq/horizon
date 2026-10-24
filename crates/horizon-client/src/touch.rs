@@ -16,6 +16,7 @@ pub const TOUCH_LAYOUT_VERSION: u8 = 1;
 const STICK_DEADZONE: f32 = 0.12;
 const MENU_LONG_PRESS: Duration = Duration::from_millis(420);
 const MENU_DRAG_THRESHOLD_PX: f32 = 10.0;
+const HOTBAR_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
 /// A control area expressed as fractions of the drawable view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -376,15 +377,15 @@ pub fn draw_overlay(
                 ui.rounded(x, y, w, h, radius, fill);
                 ui.border(x, y, w, h, radius, rgba(236, 237, 243, 116));
                 let label = match control {
-                    TouchControl::Break => "Break".to_owned(),
-                    TouchControl::Place => "Place".to_owned(),
-                    TouchControl::Jump => "Jump".to_owned(),
-                    TouchControl::Sneak => "Sneak".to_owned(),
-                    TouchControl::Sprint => "Sprint".to_owned(),
-                    TouchControl::Drop => "Drop".to_owned(),
-                    TouchControl::Inventory => "Inv".to_owned(),
-                    TouchControl::Pause => "Menu".to_owned(),
-                    TouchControl::Hotbar(slot) => (slot.min(8) + 1).to_string(),
+                    TouchControl::Break => "Break",
+                    TouchControl::Place => "Place",
+                    TouchControl::Jump => "Jump",
+                    TouchControl::Sneak => "Sneak",
+                    TouchControl::Sprint => "Sprint",
+                    TouchControl::Drop => "Drop",
+                    TouchControl::Inventory => "Inv",
+                    TouchControl::Pause => "Menu",
+                    TouchControl::Hotbar(slot) => HOTBAR_LABELS[slot.min(8) as usize],
                     TouchControl::MoveStick | TouchControl::Look => continue,
                 };
                 ui.text_centered(
@@ -393,7 +394,7 @@ pub fn draw_overlay(
                     x + w / 2.0,
                     y + (h - ui_theme::BODY * 1.45) / 2.0,
                     text,
-                    &label,
+                    label,
                 );
             }
         }

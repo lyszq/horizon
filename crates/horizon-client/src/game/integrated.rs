@@ -66,9 +66,15 @@ pub(super) struct Integrated {
 }
 impl Integrated {
     #[cfg(target_os = "ios")]
-    pub(super) fn checkpoint(&self, complete: impl FnOnce(std::result::Result<(), String>) + Send + 'static) {
-        let task: Task = Box::new(move |game| complete(game.save_game().map_err(|e| e.to_string())));
-        if self.tasks.send(task).is_err() { log::error!("The integrated server could not accept a checkpoint"); }
+    pub(super) fn checkpoint(
+        &self,
+        complete: impl FnOnce(std::result::Result<(), String>) + Send + 'static,
+    ) {
+        let task: Task =
+            Box::new(move |game| complete(game.save_game().map_err(|e| e.to_string())));
+        if self.tasks.send(task).is_err() {
+            log::error!("The integrated server could not accept a checkpoint");
+        }
     }
     pub fn smoothed_tick_ms(&self) -> f32 {
         f32::from_bits(self.flags.smoothed_tick_ms.load(Ordering::Relaxed))

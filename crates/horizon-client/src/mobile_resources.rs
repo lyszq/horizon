@@ -768,6 +768,12 @@ fn recover_transaction(paths: &TransactionPaths) -> crate::Result<()> {
     if !journal_metadata.is_file() || journal_metadata.file_type().is_symlink() {
         return Err(invalid("import transaction journal is not a regular file").into());
     }
+    if journal_metadata.len() != JOURNAL_MARKER.len() as u64 {
+        return Err(invalid(
+            "import transaction journal is corrupt; active data was left untouched",
+        )
+        .into());
+    }
     let mut marker = String::new();
     File::open(&paths.journal)?.read_to_string(&mut marker)?;
     if marker != JOURNAL_MARKER {
@@ -1143,6 +1149,23 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rejects_corrupt_journal_without_touching_active_resources() {
+        let root = temp_dir("recovery-corrupt");
+        let paths = transaction_paths(&root.join("resources")).unwrap();
+        fs::create_dir(&paths.destination).unwrap();
+        fs::write(paths.destination.join("active"), b"keep").unwrap();
+        fs::create_dir(&paths.stage).unwrap();
+        fs::write(paths.stage.join("staged"), b"candidate").unwrap();
+        fs::write(&paths.journal, b"unexpectedly large invalid journal").unwrap();
+
+        assert!(recover_transaction(&paths).is_err());
+        assert_eq!(fs::read(paths.destination.join("active")).unwrap(), b"keep");
+        assert_eq!(fs::read(paths.stage.join("staged")).unwrap(), b"candidate");
+        assert!(paths.journal.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn new_import_does_not_take_over_a_transaction_with_a_live_marker() {
         let root = temp_dir("live-transaction");
         let destination = root.join("resources");
@@ -1214,6 +1237,62 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn zip_preflight_rejects_symlinks_duplicate_names_and_case_collisions() {
+        let mut symlink_zip = ZipWriter::new(Cursor::new(Vec::new()));
+        symlink_zip
+            .start_file("link", SimpleFileOptions::default())
+            .unwrap();
+        symlink_zip.write_all(b"target").unwrap();
+        let mut symlink_bytes = symlink_zip.finish().unwrap().into_inner();
+        let central = symlink_bytes
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        symlink_bytes[central + 5] = 3; // Unix creator OS in version-made-by.
+        symlink_bytes[central + 38..central + 42]
+            .copy_from_slice(&((0o120777u32) << 16).to_le_bytes());
+        let mut symlink_archive = ZipArchive::new(Cursor::new(symlink_bytes)).unwrap();
+        assert!(
+            preflight(&mut symlink_archive, RESOURCE_LIMITS)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+
+        let mut duplicate_zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for _ in 0..2 {
+            duplicate_zip
+                .start_file("same", SimpleFileOptions::default())
+                .unwrap();
+            duplicate_zip.write_all(b"payload").unwrap();
+        }
+        let mut duplicate_archive =
+            ZipArchive::new(Cursor::new(duplicate_zip.finish().unwrap().into_inner())).unwrap();
+        assert!(
+            preflight(&mut duplicate_archive, RESOURCE_LIMITS)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate paths")
+        );
+
+        let mut case_zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["Assets/file", "assets/other"] {
+            case_zip
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            case_zip.write_all(b"payload").unwrap();
+        }
+        let mut case_archive =
+            ZipArchive::new(Cursor::new(case_zip.finish().unwrap().into_inner())).unwrap();
+        assert!(
+            preflight(&mut case_archive, RESOURCE_LIMITS)
+                .unwrap_err()
+                .to_string()
+                .contains("case-colliding")
         );
     }
 

@@ -101,7 +101,7 @@ class PackageIosTests(unittest.TestCase):
             artifact = package_ios.package(args)
 
         tools.assert_any_call(
-            ["codesign", "--force", "--sign", "-", "--timestamp=none", str(args.output_dir / "Horizon.app")],
+            ["codesign", "--force", "--sign", "-", "--timestamp=none", str(args.output_dir.resolve() / "Horizon.app")],
             check=True,
         )
         with zipfile.ZipFile(artifact) as archive:

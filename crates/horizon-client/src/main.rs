@@ -44,7 +44,10 @@ fn main() {
         return;
     };
     let config = horizon_client::launch::LaunchConfig::ipad(std::path::Path::new(&sandbox));
-    if let Err(error) = config.enter_home().and_then(|()| config.initialize_options()) {
+    if let Err(error) = config
+        .enter_home()
+        .and_then(|()| config.initialize_options())
+    {
         eprintln!("Horizon: cannot initialize iPad data: {error}");
         return;
     }
