@@ -1263,6 +1263,7 @@ dependencies = [
  "horizon-core",
  "horizon-dualsense",
  "horizon-friends",
+ "horizon-ios-platform",
  "horizon-mods",
  "horizon-protocol",
  "horizon-server-files",
@@ -1317,6 +1318,14 @@ dependencies = [
  "sha2",
  "socket2",
  "spake2",
+]
+
+[[package]]
+name = "horizon-ios-platform"
+version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "raw-window-handle",
 ]
 
 [[package]]

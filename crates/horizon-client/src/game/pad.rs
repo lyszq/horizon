@@ -3,6 +3,8 @@
 //! the vanilla key mappings they are bound to, the left stick as an analog
 //! move vector and the right stick turning the view. `horizon-ctl pad`
 //! injects a virtual pad on top of the real one.
+#[cfg(target_os = "ios")]
+mod ios;
 use super::{Game, Screen};
 use horizon_client::{
     Result,
@@ -26,7 +28,7 @@ pub(super) const HELP: &[&str] = &[
 #[derive(Default)]
 pub(super) struct Pads {
     /// The real controllers and the DualSense's output.
-    #[cfg(feature = "controllers")]
+    #[cfg(all(feature = "controllers", not(target_os = "ios")))]
     devices: hardware::Devices,
     /// The virtual pad of `horizon-ctl pad`.
     injected: PadState,
@@ -53,12 +55,12 @@ pub(super) struct Pads {
     health: HealthWatch,
 }
 
-#[cfg(feature = "controllers")]
+#[cfg(all(feature = "controllers", not(target_os = "ios")))]
 mod hardware;
 
 /// A build without the `controllers` feature (the server build, which must not need libudev): no
 /// hardware pads, only `horizon-ctl pad`'s virtual one.
-#[cfg(not(feature = "controllers"))]
+#[cfg(all(not(feature = "controllers"), not(target_os = "ios")))]
 mod hardware {
     use super::{super::Game, Pads};
     use horizon_client::gamepad::{PadState, Pulse, Rumble};

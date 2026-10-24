@@ -1106,6 +1106,25 @@ fn pairs(opts: &[Opt]) -> Vec<Row> {
         .collect()
 }
 impl OptionsUi {
+    /// Whether the selected options page currently owns a text field. Native
+    /// keyboards should stay closed on ordinary buttons and key-binding rows.
+    pub fn mobile_text_focused(&self) -> bool {
+        if self.resource_error.is_some()
+            || self.selected_key.is_some()
+            || self.selected_pad_action.is_some()
+        {
+            return false;
+        }
+        match self.page() {
+            Page::Language => true,
+            Page::Packs => self
+                .pack_screen
+                .as_ref()
+                .is_some_and(|screen| screen.search_focused()),
+            _ => self.settings_search_active(),
+        }
+    }
+
     /// A switch of `horizon-extras.txt` as the Extras page draws it: "Caption: On".
     fn extra_button(&self, s: &Settings, item: crate::extras::Item) -> Widget {
         let label = format!("{}: {}", item.caption(), item.value(&s.extras));

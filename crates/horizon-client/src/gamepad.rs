@@ -1009,7 +1009,7 @@ pub enum TriggerFeel {
     /// Mining a block of this hardness: a buzz, stronger and slower on harder blocks.
     Texture(f32),
 }
-#[cfg(feature = "controllers")]
+#[cfg(all(feature = "controllers", not(target_os = "ios")))]
 impl TriggerFeel {
     /// The effect, for a trigger that presses its action at `threshold` (0..1) of its travel.
     pub fn effect(self, threshold: f32) -> horizon_dualsense::TriggerEffect {
@@ -1045,7 +1045,7 @@ impl TriggerFeel {
         }
     }
 }
-#[cfg(feature = "controllers")]
+#[cfg(all(feature = "controllers", not(target_os = "ios")))]
 impl PadSettings {
     /// The left and right triggers' effects: each feels the action bound to it, `key.use` or
     /// `key.attack`.
@@ -1406,7 +1406,7 @@ mod tests {
         assert_eq!(w.observe(Some(1.0)), Some(1.0));
     }
 
-    #[cfg(feature = "controllers")]
+    #[cfg(all(feature = "controllers", not(target_os = "ios")))]
     #[test]
     fn triggers_feel_their_action() {
         use horizon_dualsense::{TRIGGER_OFF, trigger};

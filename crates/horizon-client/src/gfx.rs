@@ -847,9 +847,9 @@ async fn open_device(
 const NO_GPU_DRIVER: &str = "No graphics driver with Vulkan or DirectX 12 found: Horizon needs a GPU \
      driver with one of them. Install the latest driver for your NVIDIA, AMD or Intel GPU and \
      start the game again";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const NO_GPU_DRIVER: &str = "No Metal graphics device found";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
 const NO_GPU_DRIVER: &str = "No Vulkan graphics driver found: Horizon needs the Vulkan loader \
      (libvulkan.so.1) and a Vulkan driver for your GPU (Mesa's, or NVIDIA's)";
 /// Logs a step of the renderer's start, for a native crash in the graphics
@@ -872,6 +872,10 @@ fn on_off(on: bool) -> &'static str {
 }
 impl Renderer {
     /// Sections with GPU buffers, for soak tests watching residency.
+    pub fn trim_unused_memory(&mut self) {
+        self.arena.trim();
+        self.sorted_indices.trim();
+    }
     pub fn resident_sections(&self) -> usize {
         self.sections.len()
     }

@@ -55,6 +55,7 @@ env:
 
 jobs:
   decide:
+    if: github.repository == 'ludovic111/horizon'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -91,7 +92,7 @@ jobs:
 
   build:
     needs: decide
-    if: needs.decide.outputs.release == 'true'
+    if: github.repository == 'ludovic111/horizon' && (needs.decide.outputs.release == 'true')
     name: build ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -244,6 +245,7 @@ jobs:
         run: ../packaging/macos/keychain.sh lock
 
   sign:
+    if: github.repository == 'ludovic111/horizon'
     needs: [decide, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -283,6 +285,7 @@ jobs:
           retention-days: 3
 
   release:
+    if: github.repository == 'ludovic111/horizon'
     needs: [decide, build, sign]
     runs-on: ubuntu-latest
     timeout-minutes: 15
