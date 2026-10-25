@@ -103,6 +103,10 @@ class PackageIosTests(unittest.TestCase):
             self.assertEqual(metadata["commit"], args.commit)
             self.assertEqual(metadata["target"], "aarch64-apple-ios")
             self.assertEqual(metadata["sha256"]["rust_macho"], package_ios.sha256(self.binary))
+            self.assertIn("Copyright (c) 2026 Ludovic", info["NSHumanReadableCopyright"])
+            for filename, source in package_ios.LICENSE_SOURCES.items():
+                self.assertEqual(archive.read("Payload/Horizon.app/Licenses/" + filename), source.read_bytes())
+                self.assertEqual(metadata["sha256"]["license_notices"][filename], package_ios.sha256(source))
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "existing output data")
         self.assertFalse(any(path.name.startswith(".horizon-ios-payload-") for path in args.output_dir.iterdir()))
         self.assertEqual((args.output_dir / "Horizon.ipa.sha256").read_text().split()[0], package_ios.sha256(artifact))
@@ -128,6 +132,8 @@ class PackageIosTests(unittest.TestCase):
             metadata = json.loads(archive.read("Horizon.app/HorizonBuildInfo.json"))
             self.assertEqual(metadata["platform"], "simulator")
             self.assertEqual(metadata["target"], "aarch64-apple-ios-sim")
+            for filename, source in package_ios.LICENSE_SOURCES.items():
+                self.assertEqual(archive.read("Horizon.app/Licenses/" + filename), source.read_bytes())
             info = plistlib.loads(archive.read("Horizon.app/Info.plist"))
             self.assertEqual(info["DTPlatformName"], "iphonesimulator")
 

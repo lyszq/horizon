@@ -114,6 +114,10 @@ class IosIntegrationContractTests(unittest.TestCase):
                     f"Payload/Horizon.app/{package_ios.APP_NAME}",
                     "Payload/Horizon.app/Info.plist",
                     "Payload/Horizon.app/HorizonBuildInfo.json",
+                    "Payload/Horizon.app/Licenses/Horizon-MIT.txt",
+                    "Payload/Horizon.app/Licenses/OFL-Geist.txt",
+                    "Payload/Horizon.app/Licenses/OFL-PixelifySans.txt",
+                    "Payload/Horizon.app/Licenses/LICENSE-pixelarticons.txt",
                     *(f"Payload/Horizon.app/{name}" for name in package_ios.ICON_SPECS),
                 }
                 self.assertEqual(names, app_files)

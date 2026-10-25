@@ -51,7 +51,9 @@ Always-run simulator diagnostics preserve the app report, logs and screenshot ev
 
 The app bundle identifier is `dev.lyszq.horizon`. The package builder takes only Cargo's `horizon-client` Mach-O
 and the original Horizon icon under `packaging/icons/`; it never reads `.local/`, Minecraft assets, saves, or world
-data. The device `.ipa` is unsigned and has no embedded provisioning profile, so the recipient can sign it with
+data. Each app includes the original Horizon MIT license and the bundled theme fonts' and icons' notices under
+`Licenses/`; their hashes are recorded in the build metadata. The device `.ipa` is unsigned and has no embedded
+provisioning profile, so the recipient can sign it with
 their own Apple team and profile. The simulator `.app.zip` is ad-hoc signed for `simctl` installation. Each package
 includes build metadata, and each artifact has a SHA-256 sidecar. Release line tables are retained and exported as
 separate dSYM archives.

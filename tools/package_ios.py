@@ -23,6 +23,12 @@ APP_NAME = "Horizon"
 BUNDLE_ID = "dev.lyszq.horizon"
 MINIMUM_IOS = "26.0"
 ICON_SOURCE = ROOT / "packaging/icons/hicolor/512x512/apps/horizon.png"
+LICENSE_SOURCES = {
+    "Horizon-MIT.txt": ROOT / "LICENSE",
+    "OFL-Geist.txt": ROOT / "crates/horizon-theme/fonts/OFL-Geist.txt",
+    "OFL-PixelifySans.txt": ROOT / "crates/horizon-theme/fonts/OFL-PixelifySans.txt",
+    "LICENSE-pixelarticons.txt": ROOT / "crates/horizon-theme/icons/pixel/LICENSE-pixelarticons.txt",
+}
 ICON_SPECS = {
     "AppIcon60x60@2x.png": 120,
     "AppIcon60x60@3x.png": 180,
@@ -97,6 +103,7 @@ def app_info(platform: str, version: str, build_number: str, sdk_version: str) -
     return {
         "CFBundleDevelopmentRegion": "en",
         "CFBundleDisplayName": APP_NAME,
+        "NSHumanReadableCopyright": "Copyright (c) 2026 Ludovic. Horizon is MIT licensed. Not an official Minecraft product; not approved by or associated with Mojang or Microsoft.",
         "CFBundleExecutable": APP_NAME,
         "CFBundleIcons": {"CFBundlePrimaryIcon": primary_icon},
         "CFBundleIcons~ipad": {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ipad_icons, "UIPrerenderedIcon": False}},
@@ -156,7 +163,7 @@ def write_checksum(path: Path) -> None:
 
 
 def validate_app_contents(app: Path, *, allow_signature: bool) -> None:
-    expected = {APP_NAME, "Info.plist", "HorizonBuildInfo.json", *ICON_SPECS}
+    expected = {APP_NAME, "Info.plist", "HorizonBuildInfo.json", "Licenses", *ICON_SPECS}
     actual = {path.name for path in app.iterdir()}
     missing = expected - actual
     if missing:
@@ -164,6 +171,11 @@ def validate_app_contents(app: Path, *, allow_signature: bool) -> None:
     allowed = expected | ({"_CodeSignature"} if allow_signature else set())
     if actual - allowed:
         raise ValueError(f"unexpected app bundle contents: {sorted(actual - allowed)}")
+    licenses = app / "Licenses"
+    if not licenses.is_dir() or {path.name for path in licenses.iterdir()} != set(LICENSE_SOURCES):
+        raise ValueError("incomplete or unexpected bundled license notices")
+    if any(not path.is_file() or path.is_symlink() for path in licenses.iterdir()):
+        raise ValueError("invalid bundled license notice")
     if "_CodeSignature" in actual and not (app / "_CodeSignature").is_dir():
         raise ValueError("invalid app signature directory")
     if (app / "embedded.mobileprovision").exists():
@@ -195,6 +207,13 @@ def package(args: argparse.Namespace) -> Path:
     shutil.copyfile(binary, executable)
     executable.chmod(0o755)
     icon_hashes = make_icons(icon, app)
+    licenses = app / "Licenses"
+    licenses.mkdir()
+    license_hashes = {}
+    for filename, source in LICENSE_SOURCES.items():
+        destination = licenses / filename
+        shutil.copyfile(source, destination)
+        license_hashes[filename] = sha256(destination)
     (app / "Info.plist").write_bytes(
         plistlib.dumps(app_info(args.target, args.version, args.build_number, args.sdk_version), fmt=plistlib.FMT_XML, sort_keys=True)
     )
@@ -231,6 +250,7 @@ def package(args: argparse.Namespace) -> Path:
             "rust_macho": sha256(binary),
             "project_icon_source": sha256(icon),
             "icons": icon_hashes,
+            "license_notices": license_hashes,
             "dsym_tree": dsym_hash,
         },
     }
