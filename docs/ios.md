@@ -24,7 +24,7 @@ importer checks schema 7 / Minecraft 26.3, paths, expansion limits and each reso
 replacing the previous installation. Interrupted replacements are recovered on the next launch.
 
 **Touch controls** opens the layout editor; the layout and look sensitivity persist in `horizon-touch.json`.
-Gameplay offers movement, look, jump, sneak, sprint, break/use, inventory, drop, hotbar and pause. Menu swipes
+Gameplay offers movement, look, jump, sneak, sprint, break/use, inventory, chat, drop, hotbar and pause. Menu swipes
 scroll and a stationary long press performs a secondary click. GameController pads and physical keyboard/mouse
 feed the same game mappings; optional controller haptics and raw HID are not implemented on iPad.
 Control positions and the layout editor use the window's current safe area. While a system keyboard is docked,
@@ -32,12 +32,21 @@ menu layout and hit testing use the remaining visible height; the full native ga
 A floating keyboard leaves menu layout in place and can be moved by the player. UIKit supplies this geometry
 through its [keyboard layout guide](https://developer.apple.com/documentation/uikit/uikeyboardlayoutguide).
 
-The in-game **Files** button first cancels input and saves/closes the current world. Only then can world import
+Open pause or another game menu to reach **Files**. This button first cancels input and saves/closes the current world. Only then can world import
 or backup export run. Backups contain world ZIPs and available diagnostic reports; they do not contain the
 Minecraft resources. After replacing resources from a running game, close and reopen the app before playing.
 The setup screen's **Benchmark** runs the existing standard village/forest/ocean/mountain scenario with the
 current graphics settings. Benchmark operation temporarily removes the frame cap; ordinary play defaults to
 60 FPS, 12-chunk render/simulation distances and the native drawable size, without automatic quality reduction.
+On iPad the benchmark returns to the saved setup screen instead of exiting the application. It restores the
+previous VSync, frame cap and pause settings, and copies its detailed report into `Documents/benchmarks/`.
+**Share diagnostics / backups** includes these reports. Input is held while measurements run.
+
+Custom resource packs remain selectable in the normal pack screen. Copy a pack ZIP or folder into
+**Files > On My iPad > Horizon > resourcepacks**, then reopen the resource-pack screen to rescan it.
+The desktop folder-launch button is disabled on iPad and the screen shows the Files location instead.
+Prepared pack overlays live under the app's purgeable cache directory. World ZIP imports retain their
+`datapacks/` contents and use the existing game loading rules.
 
 ## Public Apple build
 

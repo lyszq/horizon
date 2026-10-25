@@ -12,16 +12,33 @@ use std::path::{Path, PathBuf};
 
 /// Where overlay roots are built (beside options.txt).
 pub fn cache_dir() -> PathBuf {
+    #[cfg(target_os = "ios")]
+    {
+        let sandbox = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
+        horizon_client::launch::AppPaths::in_sandbox(&sandbox)
+            .cache
+            .join("resourcepacks")
+    }
+    #[cfg(not(target_os = "ios"))]
     std::env::current_dir()
         .unwrap_or_default()
         .join(".horizon-cache/resourcepacks")
 }
 pub fn packs_dir() -> PathBuf {
+    #[cfg(target_os = "ios")]
+    {
+        let sandbox = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
+        horizon_client::launch::AppPaths::in_sandbox(&sandbox)
+            .documents
+            .join("resourcepacks")
+    }
+    #[cfg(not(target_os = "ios"))]
     std::env::current_dir()
         .unwrap_or_default()
         .join("resourcepacks")
 }
 /// `Util.getPlatform().openPath`: the system file manager on the folder.
+#[cfg(not(target_os = "ios"))]
 pub fn open_folder(dir: &Path) {
     let program = if cfg!(target_os = "windows") {
         "explorer"
@@ -33,6 +50,10 @@ pub fn open_folder(dir: &Path) {
     if let Err(e) = std::process::Command::new(program).arg(dir).spawn() {
         log::warn!("Horizon: could not open {}: {e}", dir.display());
     }
+}
+#[cfg(target_os = "ios")]
+pub fn open_folder(dir: &Path) {
+    log::info!("Use the iPad Files app to manage {}", dir.display());
 }
 /// The resource root to load from, given the vanilla root, the selection and
 /// a server's packs, which go on top (`Pack.Position.TOP`, fixed).

@@ -18,10 +18,20 @@ pub(super) struct MobileState {
     reports: Option<std::sync::mpsc::SyncSender<PerformanceSnapshot>>,
     setup_requested: bool,
     setup_visible: bool,
+    setup_message: Option<String>,
+    benchmark: Option<MobileBenchmark>,
     resources_changed: bool,
     pending_resource_import: bool,
     import: Option<Receiver<std::result::Result<ImportResult, String>>>,
     export: Option<Receiver<std::result::Result<PathBuf, String>>>,
+}
+
+struct MobileBenchmark {
+    result: Receiver<std::result::Result<PathBuf, String>>,
+    vsync: bool,
+    max_fps: u32,
+    inactivity_fps_limit: String,
+    no_pause: bool,
 }
 
 struct ImportResult {
@@ -575,6 +585,27 @@ fn export_backups(config: &LaunchConfig) -> Result<PathBuf> {
             bundle.write_all(&bytes)?;
         }
     }
+    match std::fs::read_dir(config.paths.documents.join("benchmarks")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && entry.path().extension().is_some_and(|ext| ext == "json")
+                {
+                    bundle.start_file(
+                        format!(
+                            "diagnostics/benchmarks/{}",
+                            entry.file_name().to_string_lossy()
+                        ),
+                        options,
+                    )?;
+                    std::io::copy(&mut File::open(entry.path())?, &mut bundle)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     bundle.finish()?.sync_all()?;
     std::fs::rename(stage, &output)?;
     Ok(output)
@@ -610,7 +641,7 @@ impl Game<'_> {
     /// returned to the game. Physical controllers must not open a world while
     /// a backup worker is reading its files.
     pub(super) fn mobile_owns_input(&self) -> bool {
-        self.mobile.setup_requested || self.mobile.setup_visible
+        self.mobile.setup_requested || self.mobile.setup_visible || self.mobile.benchmark.is_some()
     }
 
     pub(super) fn mobile_suspend(&mut self, event_loop: &ActiveEventLoop) {
@@ -708,13 +739,38 @@ impl Game<'_> {
         if self.mobile.suspended {
             return;
         }
+        let finished = match self.mobile.benchmark.as_ref().map(|b| b.result.try_recv()) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Some(Err("The benchmark worker stopped without a result.".into()))
+            }
+            _ => None,
+        };
+        if let Some(result) = finished {
+            let previous = self.mobile.benchmark.take().expect("completed benchmark");
+            self.settings.vsync = previous.vsync;
+            self.settings.max_fps = previous.max_fps;
+            self.settings.inactivity_fps_limit = previous.inactivity_fps_limit;
+            self.options.no_pause = previous.no_pause;
+            self.options.benchmark = None;
+            self.apply_settings();
+            self.mobile_reset_pad();
+            self.mobile.setup_message = Some(match result {
+                Ok(path) => match self.mobile_keep_benchmark(&path) {
+                    Ok(()) => "Benchmark complete. Normal frame settings are restored. Share diagnostics / backups to export the report.".into(),
+                    Err(error) => format!("Benchmark complete, but its report could not be copied to Documents: {error}"),
+                },
+                Err(error) => format!("Benchmark failed. Normal frame settings are restored: {error}"),
+            });
+            self.mobile.setup_requested = true;
+        }
         if self.touch_editor.is_none()
             && let Err(e) = self.touch_tick(event_loop)
         {
             log::warn!("Touch gesture: {e}");
         }
         if let Some(window) = &self.window {
-            if self.touch_editor.is_none() && !self.mobile_owns_input() {
+            if self.touch_editor.is_none() && !self.mobile_owns_input() && self.pad_in_menu() {
                 if let Err(error) = platform::setup_accessory(window.as_ref()) {
                     log::warn!("iPad Files control: {error}");
                 }
@@ -736,15 +792,17 @@ impl Game<'_> {
                 self.mobile.setup_requested = false;
                 self.mobile.setup_visible = true;
                 if let Some(window) = &self.window {
-                    let message = if self.mobile.resources_changed {
-                        "Resources were updated. Close and reopen Horizon before playing or running the benchmark."
-                    } else {
-                        "Your world has been saved. Import a world, share a backup, or return to the game."
-                    };
+                    let message = self.mobile.setup_message.take().unwrap_or_else(|| {
+                        if self.mobile.resources_changed {
+                            "Resources were updated. Close and reopen Horizon before playing or running the benchmark."
+                        } else {
+                            "Your world has been saved. Import a world, share a backup, or return to the game."
+                        }.into()
+                    });
                     let ready = !self.mobile.resources_changed
                         && self.mobile.import.is_none()
                         && self.mobile.export.is_none();
-                    let _ = platform::show_setup(window.as_ref(), message, ready);
+                    let _ = platform::show_setup(window.as_ref(), &message, ready);
                 }
             }
         }
@@ -847,6 +905,14 @@ impl Game<'_> {
             }
         }
         for event in platform::poll_events() {
+            if self.mobile.benchmark.is_some()
+                && !matches!(
+                    event,
+                    Event::AudioInterrupted | Event::AudioResume | Event::AudioRouteChanged
+                )
+            {
+                continue;
+            }
             if self.touch_editor.is_some() {
                 match event {
                     Event::AudioInterrupted => {
@@ -991,17 +1057,17 @@ impl Game<'_> {
                 {
                     self.mobile_start_backup()
                 }
-                Event::Text(text) => {
+                Event::Text(text) if !self.mobile_owns_input() => {
                     if let Err(e) = self.mobile_text(&text) {
                         log::warn!("Native text: {e}");
                     }
                 }
-                Event::Backspace => {
+                Event::Backspace if !self.mobile_owns_input() => {
                     if let Err(e) = self.mobile_backspace() {
                         log::warn!("Native backspace: {e}");
                     }
                 }
-                Event::Enter => {
+                Event::Enter if !self.mobile_owns_input() => {
                     if let Err(e) = self.mobile_enter() {
                         log::warn!("Native Enter: {e}");
                     }
@@ -1061,7 +1127,9 @@ impl Game<'_> {
                 _ => {}
             }
         }
-        let wants = self.touch_editor.is_none() && self.mobile_wants_keyboard();
+        let wants = self.touch_editor.is_none()
+            && !self.mobile_owns_input()
+            && self.mobile_wants_keyboard();
         if wants != self.mobile.keyboard {
             if let Some(window) = &self.window {
                 platform::keyboard(window.as_ref(), wants);
@@ -1116,32 +1184,48 @@ impl Game<'_> {
             }
             return;
         }
+        if let Err(error) = self.mobile_begin_benchmark("standard".into(), self.started)
+            && let Some(window) = &self.window
+        {
+            let _ = platform::show_setup(
+                window.as_ref(),
+                &format!("The benchmark could not start: {error}"),
+                true,
+            );
+        }
+    }
+
+    pub(super) fn mobile_begin_benchmark(
+        &mut self,
+        scenario: String,
+        started: Instant,
+    ) -> Result<()> {
+        if self.mobile.benchmark.is_some() {
+            return Err("A benchmark is already running".into());
+        }
+        let game_dir = std::env::current_dir()?;
+        let (completed, result) = std::sync::mpsc::channel();
+        let previous = MobileBenchmark {
+            result,
+            vsync: self.settings.vsync,
+            max_fps: self.settings.max_fps,
+            inactivity_fps_limit: self.settings.inactivity_fps_limit.clone(),
+            no_pause: self.options.no_pause,
+        };
         self.settings.vsync = false;
         self.settings.max_fps = 260;
         self.settings.inactivity_fps_limit = "minimized".into();
         self.options.no_pause = true;
+        self.options.benchmark = Some(scenario.clone());
         self.apply_settings();
-        let game_dir = match std::env::current_dir() {
-            Ok(path) => path,
-            Err(error) => {
-                if let Some(window) = &self.window {
-                    let _ = platform::show_setup(
-                        window.as_ref(),
-                        &format!("The benchmark could not start: {error}"),
-                        true,
-                    );
-                }
-                return;
-            }
-        };
         let control = self
             .control
             .get_or_insert_with(horizon_client::control::Server::local);
-        horizon_client::benchmark::start(
+        horizon_client::benchmark::start_with_completion(
             control.sender(),
             horizon_client::benchmark::Setup {
-                scenario: "standard".into(),
-                started: self.started,
+                scenario,
+                started,
                 app: horizon_bench::App {
                     name: "horizon-client".into(),
                     version: horizon_client::crash::version(),
@@ -1154,12 +1238,33 @@ impl Game<'_> {
                 offscreen: self.options.offscreen,
                 game_dir,
             },
+            move |result| {
+                let _ = completed.send(result);
+            },
         );
+        self.mobile.benchmark = Some(previous);
         self.mobile.setup_visible = false;
         if let Some(window) = &self.window {
             platform::hide_setup(window.as_ref());
         }
+        Ok(())
     }
+
+    fn mobile_keep_benchmark(&self, path: &std::path::Path) -> Result<()> {
+        let home = std::env::var_os("HOME").ok_or("The application sandbox is unavailable")?;
+        let directory = PathBuf::from(home).join("Documents/benchmarks");
+        std::fs::create_dir_all(&directory)?;
+        let name = path
+            .file_name()
+            .ok_or("The benchmark report has no filename")?;
+        let destination = directory.join(name);
+        let stage = destination.with_extension("json.tmp");
+        std::fs::copy(path, &stage)?;
+        File::open(&stage)?.sync_all()?;
+        std::fs::rename(stage, destination)?;
+        Ok(())
+    }
+
     fn mobile_start_backup(&mut self) {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             if let Some(window) = &self.window {

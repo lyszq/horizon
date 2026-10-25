@@ -163,6 +163,7 @@ pub enum TouchControl {
     Sprint,
     Drop,
     Inventory,
+    Chat,
     Pause,
     /// Hotbar slot, zero-based (0 through 8).
     Hotbar(u8),
@@ -178,6 +179,7 @@ impl TouchControl {
             Self::Sprint => Some(TouchAction::Sprint),
             Self::Drop => Some(TouchAction::Drop),
             Self::Inventory => Some(TouchAction::Inventory),
+            Self::Chat => Some(TouchAction::Chat),
             Self::Pause => Some(TouchAction::Pause),
             Self::Hotbar(slot) => Some(TouchAction::Hotbar(if slot > 8 { 8 } else { slot })),
             Self::MoveStick | Self::Look => None,
@@ -190,6 +192,13 @@ impl TouchControl {
 pub struct TouchRegion {
     pub control: TouchControl,
     pub rect: NormalizedRect,
+}
+
+fn chat_region() -> TouchRegion {
+    TouchRegion {
+        control: TouchControl::Chat,
+        rect: NormalizedRect::new(0.775, 0.045, 0.09, 0.09),
+    }
 }
 
 /// A versioned, serde-ready touch layout. Store `to_json()` beside the other
@@ -247,6 +256,7 @@ impl Default for TouchLayout {
                 rect: NormalizedRect::new(0.885, 0.045, 0.09, 0.09),
             },
         ];
+        controls.push(chat_region());
         for slot in 0..9 {
             controls.push(TouchRegion {
                 control: TouchControl::Hotbar(slot),
@@ -296,6 +306,15 @@ impl TouchLayout {
                 *slot = (*slot).min(8);
             }
         }
+        // Older saved layouts predate the touch chat button. Preserve every
+        // edited position while adding the action needed to reach text input.
+        if !self
+            .controls
+            .iter()
+            .any(|r| r.control == TouchControl::Chat)
+        {
+            self.controls.push(chat_region());
+        }
     }
 }
 
@@ -309,6 +328,7 @@ pub enum TouchAction {
     Sprint,
     Drop,
     Inventory,
+    Chat,
     Pause,
     Hotbar(u8),
 }
@@ -496,6 +516,7 @@ pub fn draw_overlay_in_safe_area(
                     TouchControl::Drop => "Drop",
                     TouchControl::Inventory => "Inv",
                     TouchControl::Pause => "Menu",
+                    TouchControl::Chat => "Chat",
                     TouchControl::Hotbar(slot) => HOTBAR_LABELS[slot.min(8) as usize],
                     TouchControl::MoveStick | TouchControl::Look => continue,
                 };
@@ -1282,6 +1303,41 @@ mod tests {
 
     fn has_action(effects: &[TouchEffect], action: TouchAction, pressed: bool) -> bool {
         effects.contains(&TouchEffect::ActionChanged { action, pressed })
+    }
+
+    #[test]
+    fn legacy_layout_adds_touch_chat_without_resetting_edited_controls() {
+        let mut legacy = TouchLayout::default();
+        legacy.controls.retain(|r| r.control != TouchControl::Chat);
+        legacy.controls[0].rect = NormalizedRect::new(0.06, 0.49, 0.29, 0.42);
+        let saved = serde_json::to_string(&legacy).unwrap();
+        let restored = TouchLayout::from_json(&saved).unwrap();
+        assert_eq!(restored.controls[0], legacy.controls[0]);
+        assert_eq!(
+            restored
+                .controls
+                .iter()
+                .filter(|r| r.control == TouchControl::Chat)
+                .count(),
+            1
+        );
+        let chat = restored
+            .controls
+            .iter()
+            .find(|r| r.control == TouchControl::Chat)
+            .unwrap()
+            .rect;
+        let mut touch = TouchControls::default();
+        touch.set_layout(restored);
+        let effects = touch.handle(event(
+            1,
+            TouchPhase::Started,
+            [chat.x + chat.width / 2.0, chat.y + chat.height / 2.0],
+            [1200.0, 800.0],
+            TouchMode::Gameplay,
+        ));
+        assert!(has_action(&effects, TouchAction::Chat, true));
+        assert!(has_action(&touch.cancel_all(), TouchAction::Chat, false));
     }
 
     #[test]

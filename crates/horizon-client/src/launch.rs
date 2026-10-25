@@ -25,6 +25,7 @@ impl AppPaths {
             std::fs::create_dir_all(path)?;
         }
         std::fs::create_dir_all(self.home.join("saves"))?;
+        std::fs::create_dir_all(self.documents.join("resourcepacks"))?;
         if let Some(parent) = self.resources.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -12881,6 +12881,7 @@ fn start_game<'a>(
         game.open_options_at(true, horizon_client::options_ui::Page::Packs);
         game.ui.options.resource_error = Some(error);
     }
+    #[cfg(not(target_os = "ios"))]
     if game.options.benchmark.is_some() {
         // The same conditions on every machine: no VSync, no frame cap, no
         // pause or idle limit without focus. In memory only, never saved.
@@ -12896,6 +12897,7 @@ fn start_game<'a>(
         game.start_mods();
     }
     game.start_agent_control()?;
+    #[cfg(not(target_os = "ios"))]
     if let Some(scenario) = game.options.benchmark.clone() {
         let control = game
             .control
@@ -12918,6 +12920,10 @@ fn start_game<'a>(
                 game_dir: std::env::current_dir()?,
             },
         );
+    }
+    #[cfg(target_os = "ios")]
+    if let Some(scenario) = game.options.benchmark.clone() {
+        game.mobile_begin_benchmark(scenario, started)?;
     }
     if let Ok(spec) = std::env::var("HORIZON_DISPENSE_FIXTURE") {
         game.dispense_fixture(&spec)?;

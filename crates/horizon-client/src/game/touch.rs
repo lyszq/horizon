@@ -427,7 +427,7 @@ impl Game<'_> {
 }
 
 #[cfg(target_os = "ios")]
-const TOUCH_ACTIONS: [TouchAction; 17] = [
+const TOUCH_ACTIONS: [TouchAction; 18] = [
     TouchAction::Break,
     TouchAction::Place,
     TouchAction::Jump,
@@ -435,6 +435,7 @@ const TOUCH_ACTIONS: [TouchAction; 17] = [
     TouchAction::Sprint,
     TouchAction::Drop,
     TouchAction::Inventory,
+    TouchAction::Chat,
     TouchAction::Pause,
     TouchAction::Hotbar(0),
     TouchAction::Hotbar(1),
@@ -456,6 +457,7 @@ fn touch_mapping(action: TouchAction) -> String {
         TouchAction::Sprint => "key.sprint".to_owned(),
         TouchAction::Drop => "key.drop".to_owned(),
         TouchAction::Inventory => "key.inventory".to_owned(),
+        TouchAction::Chat => "key.chat".to_owned(),
         TouchAction::Pause => "key.pause".to_owned(),
         TouchAction::Hotbar(slot) => format!("key.hotbar.{}", slot.min(8) + 1),
     }

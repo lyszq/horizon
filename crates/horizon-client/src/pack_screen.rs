@@ -14,6 +14,14 @@ use crate::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+fn pack_drop_info() -> Text {
+    if cfg!(target_os = "ios") {
+        Text::literal("Files: On My iPad > Horizon > resourcepacks")
+    } else {
+        tr("pack.dropInfo")
+    }
+}
+
 /// `PackCompatibility`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compat {
@@ -383,7 +391,7 @@ impl PackScreen {
     /// The header layout: title, drop info and search box, centred.
     fn header(&self, m: &Measure) -> [(i32, i32); 3] {
         let tw = m.width(&tr("resourcePack.title"));
-        let dw = m.width(&tr("pack.dropInfo"));
+        let dw = m.width(&pack_drop_info());
         let col = tw.max(dw).max(200);
         let frame = self.width.max(col);
         let lx = (0.5 * (frame - col) as f32) as i32;
@@ -515,8 +523,12 @@ impl PackScreen {
         } else {
             self.footer()
         };
-        buttons.into_iter().any(|(bx, by)| {
-            x >= bx as f64 && y >= by as f64 && x < (bx + 150) as f64 && y < (by + 20) as f64
+        buttons.into_iter().enumerate().any(|(i, (bx, by))| {
+            (i != 0 || self.confirm.is_some() || !cfg!(target_os = "ios"))
+                && x >= bx as f64
+                && y >= by as f64
+                && x < (bx + 150) as f64
+                && y < (by + 20) as f64
         })
     }
     /// A left click (`Screen.mouseClicked`).
@@ -579,6 +591,9 @@ impl PackScreen {
         }
         for (i, (bx, by)) in self.footer().into_iter().enumerate() {
             if x >= bx as f64 && y >= by as f64 && x < (bx + 150) as f64 && y < (by + 20) as f64 {
+                if i == 0 && cfg!(target_os = "ios") {
+                    return Action::None;
+                }
                 self.set_focus(Focus::Button(i));
                 return if i == 0 {
                     Action::OpenFolder
@@ -840,7 +855,7 @@ impl PackScreen {
         d::string_widget(
             &mut out,
             m,
-            &tr("pack.dropInfo").with_color(d::GRAY),
+            &pack_drop_info().with_color(d::GRAY),
             dx,
             dy,
             0,
@@ -851,11 +866,15 @@ impl PackScreen {
         }
         for (i, (bx, by)) in self.footer().into_iter().enumerate() {
             let hover = d::inside(mouse, bx, by, 150, 20);
-            let label = tr(if i == 0 {
-                "pack.openFolder"
+            let label = if i == 0 && cfg!(target_os = "ios") {
+                Text::literal("Add packs in Files")
             } else {
-                "gui.done"
-            });
+                tr(if i == 0 {
+                    "pack.openFolder"
+                } else {
+                    "gui.done"
+                })
+            };
             d::button(
                 &mut out,
                 m,
@@ -864,11 +883,16 @@ impl PackScreen {
                 by,
                 150,
                 20,
-                true,
+                i != 0 || !cfg!(target_os = "ios"),
                 hover || self.focus == Focus::Button(i),
             );
             if i == 0 && hover {
-                d::tooltip(&mut out, m, &tr("pack.folderInfo"), mouse);
+                let hint = if cfg!(target_os = "ios") {
+                    Text::literal("On My iPad > Horizon > resourcepacks")
+                } else {
+                    tr("pack.folderInfo")
+                };
+                d::tooltip(&mut out, m, &hint, mouse);
             }
         }
         out
@@ -1158,11 +1182,16 @@ mod click_sound_tests {
         ));
         let buttons = screen.footer();
         for (i, (x, y)) in buttons.into_iter().enumerate() {
-            assert!(screen.button_at(&m, x as f64 + 1.0, y as f64 + 1.0));
+            assert_eq!(
+                screen.button_at(&m, x as f64 + 1.0, y as f64 + 1.0),
+                i != 0 || !cfg!(target_os = "ios")
+            );
             assert!(!screen.button_at(&m, (x + 150) as f64, (y + 20) as f64));
             assert_eq!(
                 screen.click(&m, x as f64 + 1.0, y as f64 + 1.0),
-                if i == 0 {
+                if i == 0 && cfg!(target_os = "ios") {
+                    Action::None
+                } else if i == 0 {
                     Action::OpenFolder
                 } else {
                     Action::Done
