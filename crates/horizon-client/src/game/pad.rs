@@ -14,6 +14,8 @@ use horizon_client::{
 };
 use serde_json::{Value, json};
 use std::time::Instant;
+#[cfg(target_os = "ios")]
+use winit::event::MouseButton;
 use winit::{event_loop::ActiveEventLoop, keyboard::KeyCode};
 
 pub(super) const HELP: &[&str] = &[
@@ -92,6 +94,37 @@ impl Pads {
 }
 
 impl Game<'_> {
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_reset_pad(&mut self) {
+        self.pad.state = PadState::default();
+        self.pad.edges = Edges::default();
+        self.pad.pressed_at = [None; 16];
+        self.pad.late_releases.clear();
+        self.pad.in_use = false;
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_pad_holds_input(
+        &self,
+        input: std::result::Result<KeyCode, MouseButton>,
+    ) -> bool {
+        Button::ALL.into_iter().any(|button| {
+            (self.pad.state.held(button) || self.pad.late_releases.contains(&button))
+                && self
+                    .settings
+                    .controller
+                    .actions_of(button)
+                    .into_iter()
+                    .any(|action| {
+                        let default = KeyBinds::default_of(action);
+                        match input {
+                            Ok(key) => key_code(default) == Some(key),
+                            Err(button) => mouse_button(default) == Some(button),
+                        }
+                    })
+        })
+    }
+
     /// Once per loop iteration: read the pads and act on button changes.
     pub(super) fn poll_pads(&mut self, event_loop: &ActiveEventLoop) {
         let settings = &self.settings.controller;

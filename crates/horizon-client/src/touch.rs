@@ -4,7 +4,7 @@
 //! so the layout survives window and orientation changes. Each finger keeps
 //! the control it first touched until it ends or is cancelled.
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -262,6 +262,8 @@ pub enum TouchEffect {
         pressed: bool,
     },
     MenuPointerMoved([f32; 2]),
+    /// Winit-style wheel delta in physical pixels, opposite to finger motion.
+    MenuScrolled([f32; 2]),
     MenuMouseButton {
         button: TouchMouseButton,
         pressed: bool,
@@ -286,6 +288,7 @@ struct Finger {
     last: [f32; 2],
     started_at: Instant,
     menu_button: Option<TouchMouseButton>,
+    menu_scroll: bool,
 }
 
 /// Active touch state. The first finger in a control owns it until up/cancel;
@@ -297,6 +300,8 @@ pub struct TouchControls {
     viewport: [f32; 2],
     fingers: BTreeMap<u64, Finger>,
     action_holds: HashMap<TouchAction, usize>,
+    action_latches: HashSet<TouchAction>,
+    actions_sampled_by_player: HashSet<TouchAction>,
     movement: [f32; 2],
     move_finger: Option<u64>,
     menu_finger: Option<u64>,
@@ -410,6 +415,8 @@ impl Default for TouchControls {
             viewport: [1.0, 1.0],
             fingers: BTreeMap::new(),
             action_holds: HashMap::new(),
+            action_latches: HashSet::new(),
+            actions_sampled_by_player: HashSet::new(),
             movement: [0.0, 0.0],
             move_finger: None,
             menu_finger: None,
@@ -451,6 +458,26 @@ impl TouchControls {
         self.action_holds
             .get(&action)
             .is_some_and(|count| *count > 0)
+            || self.action_latches.contains(&action)
+    }
+
+    /// Finish one player tick after it has sampled the current touch actions.
+    /// A short Jump tap stays active through that tick, then releases here.
+    pub fn player_tick_complete(&mut self) -> Vec<TouchEffect> {
+        self.actions_sampled_by_player
+            .extend(self.action_holds.keys().copied());
+        let latches = std::mem::take(&mut self.action_latches);
+        let mut effects = Vec::new();
+        for action in latches {
+            self.actions_sampled_by_player.remove(&action);
+            if !self.action_active(action) {
+                effects.push(TouchEffect::ActionChanged {
+                    action,
+                    pressed: false,
+                });
+            }
+        }
+        effects
     }
 
     pub fn control_active(&self, control: TouchControl) -> bool {
@@ -536,6 +563,7 @@ impl TouchControls {
         };
         if finger.capture != Capture::MenuPointer
             || finger.menu_button.is_some()
+            || finger.menu_scroll
             || now.saturating_duration_since(finger.started_at) < MENU_LONG_PRESS
         {
             return Vec::new();
@@ -554,12 +582,30 @@ impl TouchControls {
     /// Release all active keys/buttons and clear every capture. Call on focus
     /// loss, app suspension or a platform-level cancellation.
     pub fn cancel_all(&mut self) -> Vec<TouchEffect> {
+        let active: HashSet<_> = self
+            .action_holds
+            .keys()
+            .copied()
+            .chain(self.action_latches.iter().copied())
+            .collect();
         let mut effects = Vec::new();
         let fingers = std::mem::take(&mut self.fingers);
         for (id, finger) in fingers {
             self.finish_finger(id, finger, true, &mut effects);
         }
+        self.action_latches.clear();
         self.action_holds.clear();
+        self.actions_sampled_by_player.clear();
+        for action in active {
+            if !effects.iter().any(|effect| {
+                matches!(effect, TouchEffect::ActionChanged { action: released, pressed: false } if *released == action)
+            }) {
+                effects.push(TouchEffect::ActionChanged {
+                    action,
+                    pressed: false,
+                });
+            }
+        }
         self.move_finger = None;
         self.menu_finger = None;
         self.mode = None;
@@ -584,6 +630,7 @@ impl TouchControls {
                 self.finish_finger(id, finger, true, effects);
             }
         }
+        effects.extend(self.player_tick_complete());
         self.mode = Some(mode);
     }
 
@@ -606,6 +653,7 @@ impl TouchControls {
             last: point,
             started_at: Instant::now(),
             menu_button: None,
+            menu_scroll: false,
         };
         match capture {
             Capture::MoveStick => {
@@ -683,15 +731,33 @@ impl TouchControls {
                 Some(_) => {
                     effects.push(TouchEffect::MenuPointerMoved(clamp_point(point)));
                 }
-                None if self.menu_drag_started(finger.anchor, point) => {
-                    effects.push(TouchEffect::MenuPointerMoved(clamp_point(finger.anchor)));
-                    effects.push(TouchEffect::MenuMouseButton {
-                        button: TouchMouseButton::Left,
-                        pressed: true,
-                        cancelled: false,
-                    });
-                    finger.menu_button = Some(TouchMouseButton::Left);
+                None if finger.menu_scroll => {
                     effects.push(TouchEffect::MenuPointerMoved(clamp_point(point)));
+                    let delta = [
+                        (finger.last[0] - point[0]) * self.viewport[0],
+                        (finger.last[1] - point[1]) * self.viewport[1],
+                    ];
+                    if delta != [0.0, 0.0] {
+                        effects.push(TouchEffect::MenuScrolled(delta));
+                    }
+                }
+                None if self.menu_drag_started(finger.anchor, point) => {
+                    let dx = (point[0] - finger.anchor[0]) * self.viewport[0];
+                    let dy = (point[1] - finger.anchor[1]) * self.viewport[1];
+                    if dy.abs() > dx.abs() {
+                        finger.menu_scroll = true;
+                        effects.push(TouchEffect::MenuPointerMoved(clamp_point(point)));
+                        effects.push(TouchEffect::MenuScrolled([-dx, -dy]));
+                    } else {
+                        effects.push(TouchEffect::MenuPointerMoved(clamp_point(finger.anchor)));
+                        effects.push(TouchEffect::MenuMouseButton {
+                            button: TouchMouseButton::Left,
+                            pressed: true,
+                            cancelled: false,
+                        });
+                        finger.menu_button = Some(TouchMouseButton::Left);
+                        effects.push(TouchEffect::MenuPointerMoved(clamp_point(point)));
+                    }
                 }
                 None => {}
             },
@@ -714,8 +780,10 @@ impl TouchControls {
             return;
         };
         let radius = (rect.width * self.viewport[0]).min(rect.height * self.viewport[1]) * 0.45;
-        let mut x = (finger.last[0] - finger.anchor[0]) * self.viewport[0] / radius;
-        let mut y = (finger.last[1] - finger.anchor[1]) * self.viewport[1] / radius;
+        // Touch coordinates grow right and down, while the shared stick vector
+        // is `[left, forward]` (the gamepad adapter performs the same inversion).
+        let mut x = (finger.anchor[0] - finger.last[0]) * self.viewport[0] / radius;
+        let mut y = (finger.anchor[1] - finger.last[1]) * self.viewport[1] / radius;
         let length = (x * x + y * y).sqrt();
         if length > 1.0 {
             x /= length;
@@ -751,30 +819,32 @@ impl TouchControls {
                     effects.push(TouchEffect::MovementChanged(self.movement));
                 }
             }
-            Capture::Action(action) => self.release_action(action, effects),
+            Capture::Action(action) => self.release_action(action, cancelled, effects),
             Capture::MenuPointer if self.menu_finger == Some(id) => {
                 self.menu_finger = None;
-                let button = finger.menu_button.unwrap_or(TouchMouseButton::Left);
-                if finger.menu_button.is_none() && !cancelled {
-                    // A short, stationary tap commits a regular left click
-                    // only when it ends, so inventory presses can still
-                    // become right-click gestures after a long hold.
-                    effects.push(TouchEffect::MenuPointerMoved(clamp_point(finger.last)));
-                    effects.push(TouchEffect::MenuMouseButton {
-                        button: TouchMouseButton::Left,
-                        pressed: true,
-                        cancelled: false,
-                    });
-                }
-                if finger.menu_button.is_some() || !cancelled {
-                    if finger.menu_button.is_some() {
+                if !finger.menu_scroll {
+                    let button = finger.menu_button.unwrap_or(TouchMouseButton::Left);
+                    if finger.menu_button.is_none() && !cancelled {
+                        // A short, stationary tap commits a regular left click
+                        // only when it ends, so inventory presses can still
+                        // become right-click gestures after a long hold.
                         effects.push(TouchEffect::MenuPointerMoved(clamp_point(finger.last)));
+                        effects.push(TouchEffect::MenuMouseButton {
+                            button: TouchMouseButton::Left,
+                            pressed: true,
+                            cancelled: false,
+                        });
                     }
-                    effects.push(TouchEffect::MenuMouseButton {
-                        button,
-                        pressed: false,
-                        cancelled,
-                    });
+                    if finger.menu_button.is_some() || !cancelled {
+                        if finger.menu_button.is_some() {
+                            effects.push(TouchEffect::MenuPointerMoved(clamp_point(finger.last)));
+                        }
+                        effects.push(TouchEffect::MenuMouseButton {
+                            button,
+                            pressed: false,
+                            cancelled,
+                        });
+                    }
                 }
             }
             Capture::MoveStick | Capture::Look | Capture::MenuPointer | Capture::Ignored => {}
@@ -782,9 +852,11 @@ impl TouchControls {
     }
 
     fn press_action(&mut self, action: TouchAction, effects: &mut Vec<TouchEffect>) {
+        let was_active = self.action_active(action);
         let count = self.action_holds.entry(action).or_default();
         *count += 1;
-        if *count == 1 {
+        if !was_active {
+            self.actions_sampled_by_player.remove(&action);
             effects.push(TouchEffect::ActionChanged {
                 action,
                 pressed: true,
@@ -792,13 +864,28 @@ impl TouchControls {
         }
     }
 
-    fn release_action(&mut self, action: TouchAction, effects: &mut Vec<TouchEffect>) {
+    fn release_action(
+        &mut self,
+        action: TouchAction,
+        cancelled: bool,
+        effects: &mut Vec<TouchEffect>,
+    ) {
+        let was_active = self.action_active(action);
         let Some(count) = self.action_holds.get_mut(&action) else {
             return;
         };
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.action_holds.remove(&action);
+            if action == TouchAction::Jump && !cancelled {
+                if !self.actions_sampled_by_player.remove(&action) {
+                    self.action_latches.insert(action);
+                }
+            } else {
+                self.actions_sampled_by_player.remove(&action);
+            }
+        }
+        if was_active && !self.action_active(action) {
             effects.push(TouchEffect::ActionChanged {
                 action,
                 pressed: false,
@@ -836,9 +923,198 @@ fn clamp_point(point: [f32; 2]) -> [f32; 2] {
     point.map(|v| v.clamp(0.0, 1.0))
 }
 
+/// A draft layout is isolated from live gameplay until the player presses Save.
+pub struct LayoutEditor {
+    pub draft: TouchLayout,
+    fingers: BTreeMap<u64, (usize, [f32; 2])>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorCommand {
+    Save,
+    Cancel,
+}
+
+impl LayoutEditor {
+    pub fn new(layout: &TouchLayout) -> Self {
+        Self {
+            draft: layout.clone(),
+            fingers: BTreeMap::new(),
+        }
+    }
+    pub fn handle(&mut self, id: u64, phase: TouchPhase, point: [f32; 2]) -> Option<EditorCommand> {
+        if !point.iter().all(|v| v.is_finite()) {
+            self.fingers.remove(&id);
+            return None;
+        }
+        let point = clamp_point(point);
+        match phase {
+            TouchPhase::Started if point[1] <= 0.11 => {
+                // A toolbar capture is deliberately outside the controls' index range.
+                let action = if point[0] < 0.20 {
+                    0
+                } else if point[0] < 0.40 {
+                    1
+                } else if point[0] < 0.60 {
+                    2
+                } else if point[0] < 0.80 {
+                    3
+                } else {
+                    4
+                };
+                self.fingers.insert(id, (usize::MAX - action, point));
+            }
+            TouchPhase::Started => {
+                if let Some(index) = self
+                    .draft
+                    .controls
+                    .iter()
+                    .rposition(|r| r.rect.contains(point))
+                {
+                    self.fingers.insert(id, (index, point));
+                }
+            }
+            TouchPhase::Moved => {
+                let (index, previous) = self.fingers.get(&id).copied()?;
+                if index >= self.draft.controls.len() {
+                    return None;
+                }
+                let other = self
+                    .fingers
+                    .iter()
+                    .find(|(other_id, (i, _))| **other_id != id && *i == index)
+                    .map(|(_, (_, p))| *p);
+                let rect = &mut self.draft.controls[index].rect;
+                if let Some(anchor) = other {
+                    let distance = |p: [f32; 2]| {
+                        ((p[0] - anchor[0]).powi(2) + (p[1] - anchor[1]).powi(2)).sqrt()
+                    };
+                    let old = distance(previous);
+                    if old > 0.015 {
+                        let scale = (distance(point) / old).clamp(0.8, 1.25);
+                        let center = [rect.x + rect.width / 2.0, rect.y + rect.height / 2.0];
+                        rect.width *= scale;
+                        rect.height *= scale;
+                        rect.x = center[0] - rect.width / 2.0;
+                        rect.y = center[1] - rect.height / 2.0;
+                    }
+                } else {
+                    rect.x += point[0] - previous[0];
+                    rect.y += point[1] - previous[1];
+                }
+                rect.sanitize();
+                rect.y = rect.y.max(0.12).min(1.0 - rect.height);
+                self.fingers.insert(id, (index, point));
+            }
+            TouchPhase::Ended => {
+                let (index, start) = self.fingers.remove(&id)?;
+                if index > usize::MAX - 5 && point[1] <= 0.11 && (point[0] - start[0]).abs() < 0.12
+                {
+                    match usize::MAX - index {
+                        0 => return Some(EditorCommand::Save),
+                        1 => {
+                            self.draft = TouchLayout::default();
+                            self.fingers.clear();
+                        }
+                        2 => {
+                            self.draft.look_sensitivity =
+                                (self.draft.look_sensitivity - 0.05).max(0.05)
+                        }
+                        3 => {
+                            self.draft.look_sensitivity =
+                                (self.draft.look_sensitivity + 0.05).min(2.0)
+                        }
+                        _ => return Some(EditorCommand::Cancel),
+                    }
+                }
+            }
+            TouchPhase::Cancelled => {
+                self.fingers.remove(&id);
+            }
+        }
+        None
+    }
+
+    /// Drop in-progress editor gestures when the platform cancels touches.
+    pub fn cancel_all(&mut self) {
+        self.fingers.clear();
+    }
+}
+
+pub fn draw_layout_editor(editor: &LayoutEditor, atlas: &HudAtlas, batch: &mut HudBatch) {
+    let mut controls = TouchControls::default();
+    controls.set_layout(editor.draft.clone());
+    controls.set_enabled(true);
+    draw_overlay(&controls, atlas, batch, (0.0, 0.0));
+    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+    for region in &editor.draft.controls {
+        if region.control == TouchControl::Look {
+            let rect = region.rect;
+            let (x, y, w, h) = (
+                rect.x * ui.w,
+                rect.y * ui.h,
+                rect.width * ui.w,
+                rect.height * ui.h,
+            );
+            ui.border(x, y, w, h, 8.0, rgba(236, 237, 243, 112));
+            ui.text_centered(
+                Face::Medium,
+                ui_theme::BODY * 0.8,
+                x + w / 2.0,
+                y + 8.0,
+                ui_theme::color::TEXT,
+                "Look zone",
+            );
+        }
+    }
+    ui.rounded(0.0, 0.0, ui.w, ui.h * 0.12, 0.0, rgba(13, 14, 19, 245));
+    for (index, label) in ["Save", "Reset", "Look -", "Look +", "Cancel"]
+        .iter()
+        .enumerate()
+    {
+        ui.text_centered(
+            Face::Medium,
+            ui_theme::BODY,
+            ui.w * (index as f32 * 0.2 + 0.1),
+            ui.h * 0.025,
+            ui_theme::color::TEXT,
+            label,
+        );
+    }
+    let message = format!(
+        "Drag to move; two fingers on a control to resize. Look sensitivity: {:.2}",
+        editor.draft.look_sensitivity
+    );
+    ui.text_centered(
+        Face::Regular,
+        ui_theme::BODY * 0.8,
+        ui.w * 0.5,
+        ui.h * 0.125,
+        ui_theme::color::TEXT,
+        &message,
+    );
+    ui.finish();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_keeps_changes_in_a_draft_and_cancel_does_not_commit() {
+        let original = TouchLayout::default();
+        let mut editor = LayoutEditor::new(&original);
+        let rect = editor.draft.controls[0].rect;
+        let start = [rect.x + rect.width / 2.0, rect.y + rect.height / 2.0];
+        editor.handle(1, TouchPhase::Started, start);
+        editor.handle(1, TouchPhase::Moved, [start[0] + 0.1, start[1] - 0.1]);
+        assert_ne!(editor.draft.controls[0].rect, original.controls[0].rect);
+        editor.handle(2, TouchPhase::Started, [0.9, 0.05]);
+        assert_eq!(
+            editor.handle(2, TouchPhase::Ended, [0.9, 0.05]),
+            Some(EditorCommand::Cancel)
+        );
+        assert_eq!(original, TouchLayout::default());
+    }
 
     fn event(
         id: u64,
@@ -897,7 +1173,7 @@ mod tests {
         assert!(
             movement
                 .iter()
-                .any(|effect| matches!(effect, TouchEffect::MovementChanged([x, _]) if *x > 0.5))
+                .any(|effect| matches!(effect, TouchEffect::MovementChanged([x, _]) if *x < -0.5))
         );
         let look = touch.handle(event(
             2,
@@ -920,7 +1196,7 @@ mod tests {
         ));
         assert!(has_action(&released, TouchAction::Break, false));
         assert!(!touch.action_active(TouchAction::Break));
-        assert!(touch.movement_vector()[0] > 0.5);
+        assert!(touch.movement_vector()[0] < -0.5);
 
         let cancelled = touch.handle(event(
             1,
@@ -1233,5 +1509,160 @@ mod tests {
             pressed: false,
             cancelled: false,
         }));
+    }
+
+    #[test]
+    fn joystick_uses_left_and_forward_axes_for_screen_directions() {
+        let mut touch = TouchControls::default();
+        let viewport = [1200.0, 800.0];
+        let anchor = [0.16, 0.70];
+        touch.handle(event(
+            1,
+            TouchPhase::Started,
+            anchor,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+
+        touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [anchor[0] + 0.20, anchor[1]],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.movement_vector()[0] < -0.99);
+        assert!(touch.movement_vector()[1].abs() < 0.001);
+
+        touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [anchor[0], anchor[1] - 0.20],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.movement_vector()[0].abs() < 0.001);
+        assert!(touch.movement_vector()[1] > 0.99);
+
+        touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [anchor[0], anchor[1] + 0.20],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.movement_vector()[1] < -0.99);
+    }
+
+    #[test]
+    fn short_jump_tap_stays_held_until_one_player_tick() {
+        let mut touch = TouchControls::default();
+        let viewport = [1024.0, 768.0];
+        let point = [0.88, 0.855];
+        let press = touch.handle(event(
+            1,
+            TouchPhase::Started,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(has_action(&press, TouchAction::Jump, true));
+
+        let release = touch.handle(event(
+            1,
+            TouchPhase::Ended,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(!has_action(&release, TouchAction::Jump, false));
+        assert!(touch.action_active(TouchAction::Jump));
+
+        let tick = touch.player_tick_complete();
+        assert_eq!(
+            tick,
+            vec![TouchEffect::ActionChanged {
+                action: TouchAction::Jump,
+                pressed: false,
+            }]
+        );
+        assert!(!touch.action_active(TouchAction::Jump));
+        assert!(touch.player_tick_complete().is_empty());
+    }
+
+    #[test]
+    fn held_jump_releases_after_sampled_tick_and_cancel_flushes_a_tap_latch() {
+        let mut touch = TouchControls::default();
+        let viewport = [1024.0, 768.0];
+        let point = [0.88, 0.855];
+        let press = event(1, TouchPhase::Started, point, viewport, TouchMode::Gameplay);
+        let release = event(1, TouchPhase::Ended, point, viewport, TouchMode::Gameplay);
+
+        touch.handle(press);
+        assert!(touch.player_tick_complete().is_empty());
+        let release_after_tick = touch.handle(release);
+        assert!(has_action(&release_after_tick, TouchAction::Jump, false));
+        assert!(!touch.action_active(TouchAction::Jump));
+
+        touch.handle(press);
+        touch.handle(release);
+        assert!(touch.action_active(TouchAction::Jump));
+        assert!(has_action(&touch.cancel_all(), TouchAction::Jump, false));
+        assert!(!touch.action_active(TouchAction::Jump));
+        assert!(touch.player_tick_complete().is_empty());
+    }
+
+    #[test]
+    fn vertical_menu_swipe_scrolls_without_clicking() {
+        let mut touch = TouchControls::default();
+        let viewport = [1024.0, 768.0];
+        touch.handle(event(
+            1,
+            TouchPhase::Started,
+            [0.5, 0.5],
+            viewport,
+            TouchMode::Menu,
+        ));
+
+        let first = touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [0.5, 0.55],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(first.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::MenuScrolled([x, y]) if x.abs() < 0.001 && (*y + 38.4).abs() < 0.01
+        )));
+        assert!(
+            !first
+                .iter()
+                .any(|effect| matches!(effect, TouchEffect::MenuMouseButton { .. }))
+        );
+
+        let continued = touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [0.5, 0.60],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(continued.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::MenuScrolled([x, y]) if x.abs() < 0.001 && (*y + 38.4).abs() < 0.01
+        )));
+
+        let end = touch.handle(event(
+            1,
+            TouchPhase::Ended,
+            [0.5, 0.60],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(
+            !end.iter()
+                .any(|effect| matches!(effect, TouchEffect::MenuMouseButton { .. }))
+        );
     }
 }

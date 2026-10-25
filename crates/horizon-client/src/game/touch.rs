@@ -8,12 +8,78 @@ use horizon_client::{
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalPosition,
-    event::{DeviceId, ElementState, MouseButton, TouchPhase as WinitTouchPhase, WindowEvent},
+    event::{
+        DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase as WinitTouchPhase,
+        WindowEvent,
+    },
     event_loop::ActiveEventLoop,
     keyboard::KeyCode,
 };
 
 impl Game<'_> {
+    #[cfg(target_os = "ios")]
+    pub(super) fn begin_touch_edit(&mut self) {
+        self.touch.cancel_all();
+        self.keys.clear();
+        self.physical_keys.clear();
+        self.left = false;
+        self.right = false;
+        self.toggles = Default::default();
+        self.touch_editor = Some(horizon_client::touch::LayoutEditor::new(
+            self.touch.layout(),
+        ));
+        if let Some(window) = &self.window {
+            horizon_ios_platform::hide_setup(window.as_ref());
+            horizon_ios_platform::hide_accessory(window.as_ref());
+            horizon_ios_platform::keyboard(window.as_ref(), false);
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    fn touch_editor_input(
+        &mut self,
+        id: u64,
+        phase: WinitTouchPhase,
+        x: f64,
+        y: f64,
+    ) -> horizon_client::Result<()> {
+        use horizon_client::touch::{EditorCommand, TouchPhase};
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
+        let size = window.inner_size();
+        let point = [
+            x as f32 / size.width.max(1) as f32,
+            y as f32 / size.height.max(1) as f32,
+        ];
+        let phase = match phase {
+            WinitTouchPhase::Started => TouchPhase::Started,
+            WinitTouchPhase::Moved => TouchPhase::Moved,
+            WinitTouchPhase::Ended => TouchPhase::Ended,
+            WinitTouchPhase::Cancelled => TouchPhase::Cancelled,
+        };
+        let command = self
+            .touch_editor
+            .as_mut()
+            .and_then(|e| e.handle(id, phase, point));
+        if let Some(command) = command {
+            if command == EditorCommand::Save {
+                let editor = self.touch_editor.as_ref().unwrap();
+                let json = editor.draft.to_json()?;
+                std::fs::write("horizon-touch.json.tmp", &json)?;
+                std::fs::rename("horizon-touch.json.tmp", "horizon-touch.json")?;
+                self.touch.set_layout(editor.draft.clone());
+                if let Some(sandbox) = std::env::var_os("HOME") {
+                    let path =
+                        std::path::PathBuf::from(sandbox).join("Documents/horizon-touch.json");
+                    std::fs::write(path, json)?;
+                }
+            }
+            self.touch_editor = None;
+        }
+        Ok(())
+    }
+
     /// Feed one native touch sample to the controls. The event hook passes the
     /// platform's physical position; capture and layout stay normalized.
     pub(super) fn touch_input(
@@ -24,6 +90,11 @@ impl Game<'_> {
         x: f64,
         y: f64,
     ) -> horizon_client::Result<()> {
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_some() {
+            self.touch_editor_input(id, phase, x, y)?;
+            return Ok(());
+        }
         if !self.touch.enabled() {
             return Ok(());
         }
@@ -75,6 +146,10 @@ impl Game<'_> {
         &mut self,
         event_loop: &ActiveEventLoop,
     ) -> horizon_client::Result<()> {
+        #[cfg(target_os = "ios")]
+        if let Some(editor) = &mut self.touch_editor {
+            editor.cancel_all();
+        }
         for effect in self.touch.cancel_all() {
             self.apply_touch_effect(event_loop, effect)?;
         }
@@ -84,6 +159,7 @@ impl Game<'_> {
     /// Advance stationary menu-finger gestures. The app poll hook should call
     /// this each frame so long presses turn into right clicks without needing
     /// another native touch-move event.
+    #[cfg(target_os = "ios")]
     pub(super) fn touch_tick(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -92,6 +168,38 @@ impl Game<'_> {
             self.apply_touch_effect(event_loop, effect)?;
         }
         Ok(())
+    }
+
+    /// Complete touch action latches only after the player's tick sampled them.
+    #[cfg(target_os = "ios")]
+    pub(super) fn touch_player_tick(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> horizon_client::Result<()> {
+        let effects = self.touch.player_tick_complete();
+        for effect in effects {
+            self.apply_touch_effect(event_loop, effect)?;
+        }
+        Ok(())
+    }
+
+    /// Whether an active touch still owns the default keyboard mapping.
+    #[cfg(target_os = "ios")]
+    pub(super) fn touch_holds_default_key(&self, key: KeyCode) -> bool {
+        self.touch.enabled()
+            && TOUCH_ACTIONS.into_iter().any(|action| {
+                self.touch.action_active(action) && touch_action_key(action) == Some(key)
+            })
+    }
+
+    /// Whether an active touch still owns a default mouse mapping.
+    #[cfg(target_os = "ios")]
+    pub(super) fn touch_holds_mouse(&self, button: MouseButton) -> bool {
+        self.touch.enabled()
+            && TOUCH_ACTIONS.into_iter().any(|action| {
+                self.touch.action_active(action)
+                    && mouse_button(KeyBinds::default_of(&touch_mapping(action))) == Some(button)
+            })
     }
 
     fn apply_touch_effect(
@@ -122,6 +230,9 @@ impl Game<'_> {
             TouchEffect::MenuPointerMoved(position) => {
                 self.touch_pointer_to(event_loop, position);
             }
+            TouchEffect::MenuScrolled([x, y]) => {
+                self.touch_pointer_scroll(event_loop, [x, y]);
+            }
             TouchEffect::MenuMouseButton {
                 button,
                 pressed,
@@ -137,17 +248,10 @@ impl Game<'_> {
     }
 
     fn touch_action(&mut self, action: TouchAction, pressed: bool) -> horizon_client::Result<()> {
-        let mapping = match action {
-            TouchAction::Break => "key.attack".to_owned(),
-            TouchAction::Place => "key.use".to_owned(),
-            TouchAction::Jump => "key.jump".to_owned(),
-            TouchAction::Sneak => "key.sneak".to_owned(),
-            TouchAction::Sprint => "key.sprint".to_owned(),
-            TouchAction::Drop => "key.drop".to_owned(),
-            TouchAction::Inventory => "key.inventory".to_owned(),
-            TouchAction::Pause => return self.mapped_key(KeyCode::Escape, pressed, false),
-            TouchAction::Hotbar(slot) => format!("key.hotbar.{}", slot.min(8) + 1),
-        };
+        if action == TouchAction::Pause {
+            return self.mapped_key(KeyCode::Escape, pressed, false);
+        }
+        let mapping = touch_mapping(action);
         let default = KeyBinds::default_of(&mapping);
         if let Some(button) = mouse_button(default) {
             if self.screen == Screen::Playing && self.title.is_none() {
@@ -212,6 +316,24 @@ impl Game<'_> {
         );
     }
 
+    fn touch_pointer_scroll(&mut self, event_loop: &ActiveEventLoop, delta: [f32; 2]) {
+        let Some(id) = self.window.as_ref().map(|window| window.id()) else {
+            return;
+        };
+        self.window_event(
+            event_loop,
+            id,
+            WindowEvent::MouseWheel {
+                device_id: DeviceId::dummy(),
+                delta: MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                    f64::from(delta[0]),
+                    f64::from(delta[1]),
+                )),
+                phase: WinitTouchPhase::Moved,
+            },
+        );
+    }
+
     /// A system cancellation must release the synthetic mouse without
     /// committing a half-finished inventory quick-craft or scrollbar drag.
     fn cancel_touch_menu_drag(&mut self) {
@@ -232,6 +354,11 @@ impl Game<'_> {
     /// Draw the touch controls over gameplay. Menu touches use the normal
     /// cursor and mouse handlers, so this overlay stays out of vanilla screens.
     pub(super) fn draw_touch_overlay(&self, batch: &mut HudBatch) {
+        #[cfg(target_os = "ios")]
+        if let Some(editor) = &self.touch_editor {
+            horizon_client::touch::draw_layout_editor(editor, &self.gui.atlas, batch);
+            return;
+        }
         if !self.touch.enabled()
             || self.player.is_none()
             || self.pad_in_menu()
@@ -240,5 +367,48 @@ impl Game<'_> {
             return;
         }
         horizon_client::touch::draw_overlay(&self.touch, &self.gui.atlas, batch, self.cursor);
+    }
+}
+
+#[cfg(target_os = "ios")]
+const TOUCH_ACTIONS: [TouchAction; 17] = [
+    TouchAction::Break,
+    TouchAction::Place,
+    TouchAction::Jump,
+    TouchAction::Sneak,
+    TouchAction::Sprint,
+    TouchAction::Drop,
+    TouchAction::Inventory,
+    TouchAction::Pause,
+    TouchAction::Hotbar(0),
+    TouchAction::Hotbar(1),
+    TouchAction::Hotbar(2),
+    TouchAction::Hotbar(3),
+    TouchAction::Hotbar(4),
+    TouchAction::Hotbar(5),
+    TouchAction::Hotbar(6),
+    TouchAction::Hotbar(7),
+    TouchAction::Hotbar(8),
+];
+
+fn touch_mapping(action: TouchAction) -> String {
+    match action {
+        TouchAction::Break => "key.attack".to_owned(),
+        TouchAction::Place => "key.use".to_owned(),
+        TouchAction::Jump => "key.jump".to_owned(),
+        TouchAction::Sneak => "key.sneak".to_owned(),
+        TouchAction::Sprint => "key.sprint".to_owned(),
+        TouchAction::Drop => "key.drop".to_owned(),
+        TouchAction::Inventory => "key.inventory".to_owned(),
+        TouchAction::Pause => "key.pause".to_owned(),
+        TouchAction::Hotbar(slot) => format!("key.hotbar.{}", slot.min(8) + 1),
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn touch_action_key(action: TouchAction) -> Option<KeyCode> {
+    match action {
+        TouchAction::Pause => Some(KeyCode::Escape),
+        _ => key_code(KeyBinds::default_of(&touch_mapping(action))),
     }
 }

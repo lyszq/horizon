@@ -574,6 +574,7 @@ impl Game<'_> {
     }
 
     /// Backspace from the native keyboard on the focused command box.
+    #[cfg(target_os = "ios")]
     pub(super) fn command_block_mobile_backspace(&mut self) {
         let ctrl = self.keys.contains(&KeyCode::ControlLeft);
         let shift = self.keys.contains(&KeyCode::ShiftLeft);
@@ -583,6 +584,7 @@ impl Game<'_> {
     }
 
     /// Enter from the native keyboard: save and close like the screen's Done key.
+    #[cfg(target_os = "ios")]
     pub(super) fn command_block_mobile_enter(&mut self) {
         if let Some(screen) = self.command_block_screen.take() {
             self.set_command_block(&screen);

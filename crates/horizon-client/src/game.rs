@@ -1197,6 +1197,8 @@ struct Game<'a> {
     keys: HashSet<KeyCode>,
     // Physical input is separate from remapped and toggled movement keys.
     physical_keys: HashSet<KeyCode>,
+    #[cfg(target_os = "ios")]
+    physical_mouse: HashSet<MouseButton>,
     left: bool,
     right: bool,
     cursor: (f32, f32),
@@ -1238,6 +1240,8 @@ struct Game<'a> {
     /// Controllers (Horizon's own).
     pad: pad::Pads,
     touch: horizon_client::touch::TouchControls,
+    #[cfg(target_os = "ios")]
+    touch_editor: Option<horizon_client::touch::LayoutEditor>,
     #[cfg(target_os = "ios")]
     mobile: mobile::MobileState,
     frames: u64,
@@ -4477,6 +4481,10 @@ impl Game<'_> {
     /// A key event after rebinding, as the default key of its mapping (the
     /// keyboard and controllers both end here).
     fn mapped_key(&mut self, key: KeyCode, pressed: bool, repeat: bool) -> Result<()> {
+        #[cfg(target_os = "ios")]
+        if !pressed && self.mobile_input_held(Ok(key)) {
+            return Ok(());
+        }
         // Sneak and sprint are ToggleKeyMappings: a press (or a key
         // repeat) flips them when toggling; only releases reach them
         // behind a screen (KeyboardHandler.keyPress).
@@ -10471,6 +10479,10 @@ impl Game<'_> {
     }
     /// A mouse button while playing (window or control socket).
     fn play_mouse(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
+        #[cfg(target_os = "ios")]
+        if !pressed && self.mobile_input_held(Err(button)) {
+            return Ok(());
+        }
         if self.sleeping.is_some() {
             return Ok(());
         }
@@ -10795,6 +10807,27 @@ impl ApplicationHandler for Game<'_> {
         if self.mobile.suspended && matches!(event, WindowEvent::RedrawRequested) {
             return;
         }
+        #[cfg(target_os = "ios")]
+        if self.mobile_owns_input()
+            && !matches!(
+                event,
+                WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::Focused(_)
+            )
+        {
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_some()
+            && !matches!(
+                event,
+                WindowEvent::Touch(_)
+                    | WindowEvent::RedrawRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::Focused(_)
+            )
+        {
+            return;
+        }
         if let WindowEvent::Touch(touch) = &event {
             if let Err(error) = self.touch_input(
                 event_loop,
@@ -10807,10 +10840,10 @@ impl ApplicationHandler for Game<'_> {
             }
             return;
         }
-        if matches!(event, WindowEvent::Focused(false) | WindowEvent::Resized(_)) {
-            if let Err(error) = self.cancel_touch_input(event_loop) {
-                log::warn!("Horizon touch release: {error}");
-            }
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::Resized(_))
+            && let Err(error) = self.cancel_touch_input(event_loop)
+        {
+            log::warn!("Horizon touch release: {error}");
         }
 
         if let WindowEvent::KeyboardInput { event, .. } = &event
@@ -10822,8 +10855,18 @@ impl ApplicationHandler for Game<'_> {
                 self.physical_keys.remove(&key);
             }
         }
+        #[cfg(target_os = "ios")]
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if *state == ElementState::Pressed {
+                self.physical_mouse.insert(*button);
+            } else {
+                self.physical_mouse.remove(button);
+            }
+        }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
+            #[cfg(target_os = "ios")]
+            self.physical_mouse.clear();
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
@@ -11466,6 +11509,8 @@ impl ApplicationHandler for Game<'_> {
                         if self.title.is_none() && !self.pause {
                             let tick = Instant::now();
                             horizon_client::spans::time("tick", || self.tick())?;
+                            #[cfg(target_os = "ios")]
+                            self.touch_player_tick()?;
                             // In single player the tick is the integrated server's.
                             if self.remote.is_none() {
                                 self.perf.tick(tick.elapsed().as_secs_f32() * 1000.0);
@@ -11608,6 +11653,10 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_some() || self.mobile_owns_input() {
+            return;
+        }
         if self.pending_save.is_none()
             && self.captured
             && self.focused
@@ -11657,7 +11706,12 @@ impl ApplicationHandler for Game<'_> {
         if self.pending_save.is_some() {
             return;
         }
+        #[cfg(not(target_os = "ios"))]
         self.poll_pads(event_loop);
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_none() && !self.mobile_owns_input() {
+            self.poll_pads(event_loop);
+        }
         if self.options.frames.is_some() && self.started.elapsed() > self.options.timeout {
             self.error = Some("frame-limited run timed out".into());
             event_loop.exit();
@@ -11798,6 +11852,8 @@ impl<'a> Game<'a> {
             },
             keys: HashSet::new(),
             physical_keys: HashSet::new(),
+            #[cfg(target_os = "ios")]
+            physical_mouse: HashSet::new(),
             left: false,
             right: false,
             cursor: (0.0, 0.0),
@@ -11825,6 +11881,8 @@ impl<'a> Game<'a> {
             last_input: now,
             pad: Default::default(),
             touch: mobile_touch_controls(),
+            #[cfg(target_os = "ios")]
+            touch_editor: None,
             #[cfg(target_os = "ios")]
             mobile: Default::default(),
             frames: 0,
@@ -12938,6 +12996,8 @@ fn run_event_loop(mut game: Game<'_>) -> Result<()> {
 struct Loading {
     #[cfg(target_os = "ios")]
     mobile_suspended: bool,
+    #[cfg(target_os = "ios")]
+    mobile_edit_touch: bool,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     gui: Option<UiResources>,
@@ -13195,6 +13255,10 @@ impl Loading {
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
         self.menu.handoff(&mut game);
+        #[cfg(target_os = "ios")]
+        if self.mobile_edit_touch {
+            game.begin_touch_edit();
+        }
         game.apply_settings();
         game.previous = Instant::now();
         log::info!(
@@ -13340,6 +13404,8 @@ fn make_loading(
     let loading = Loading {
         #[cfg(target_os = "ios")]
         mobile_suspended: false,
+        #[cfg(target_os = "ios")]
+        mobile_edit_touch: false,
         window: None,
         renderer: None,
         gui: None,

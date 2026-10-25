@@ -1,11 +1,47 @@
 # iOS and iPad package
 
+The port starts from upstream v0.2.48 (`7f995af677c6558e87b1ba4b035dfe12037dc9f2`). Development is on
+`ios/ipad` in the public `lyszq/horizon` fork, reviewed in draft PR #1. The first physical acceptance device is
+an iPad Air M2 on iPadOS 26.3. An unsigned IPA still needs the user's sideload signing before it can run there.
+
+## Private resource transfer and controls
+
+With Rust, Python and JDK 25 available on the PC, prepare a transfer from your own installed Java Edition 26.3:
+
+```powershell
+python tools/prepare_ipad_resources.py --minecraft-dir "$env:APPDATA/.minecraft" --server-jar "C:/path/to/server.jar" --java-home "C:/path/to/jdk-25"
+```
+
+An existing prepared tree can be packaged without running Java:
+
+```powershell
+python tools/prepare_ipad_resources.py --prepared .local/horizon-client/26.3
+```
+
+Both routes produce `.local/ipad/horizon-resources-26.3.zip` and print its SHA-256. Keep this ZIP private and
+separate from the IPA. On iPad, choose **Import resources** and select the ZIP in Files, then **Play**. The
+importer checks schema 7 / Minecraft 26.3, paths, expansion limits and each resource's size/hash before
+replacing the previous installation. Interrupted replacements are recovered on the next launch.
+
+**Touch controls** opens the layout editor; the layout and look sensitivity persist in `horizon-touch.json`.
+Gameplay offers movement, look, jump, sneak, sprint, break/use, inventory, drop, hotbar and pause. Menu swipes
+scroll and a stationary long press performs a secondary click. GameController pads and physical keyboard/mouse
+feed the same game mappings; optional controller haptics and raw HID are not implemented on iPad.
+
+The in-game **Files** button first cancels input and saves/closes the current world. Only then can world import
+or backup export run. Backups contain world ZIPs and available diagnostic reports; they do not contain the
+Minecraft resources. After replacing resources from a running game, close and reopen the app before playing.
+The setup screen's **Benchmark** runs the existing standard village/forest/ocean/mountain scenario with the
+current graphics settings. Benchmark operation temporarily removes the frame cap; ordinary play defaults to
+60 FPS, 12-chunk render/simulation distances and the native drawable size, without automatic quality reduction.
+
+## Public Apple build
+
 The public iOS workflow builds the existing `horizon-client` Rust executable for physical arm64 iOS and the Apple
-Silicon simulator. It uses the `iphoneos` and `iphonesimulator` SDKs selected by Xcode on the standard
-`macos-26` GitHub-hosted runner, sets the minimum OS to iOS 26.0, and records the exact Rust, Xcode, SDK, and commit
-versions in each package's `build-metadata.json`. Until the first green run establishes a verified baseline, the
-workflow follows installed Rust `stable` and the runner's selected stable Xcode; the recorded versions are the
-inputs for pinning that baseline.
+Silicon simulator. It installs Rust 1.99.1 and both Apple Silicon iOS targets, uses the `iphoneos` and
+`iphonesimulator` SDKs selected by Xcode on the standard `macos-26` GitHub-hosted runner, and sets the minimum OS to
+iOS 26.0. Each package records the exact Rust, Xcode, SDK, and commit versions in `build-metadata.json` so the
+resolved build inputs can be checked against the first green run and any later toolchain changes.
 
 The app bundle identifier is `dev.lyszq.horizon`. The package builder takes only Cargo's `horizon-client` Mach-O
 and the original Horizon icon under `packaging/icons/`; it never reads `.local/`, Minecraft assets, saves, or world

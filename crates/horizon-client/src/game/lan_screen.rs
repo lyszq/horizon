@@ -114,6 +114,7 @@ fn labelled(key: &str, value: Text) -> Text {
 
 impl WorldOptions {
     /// Whether the visible world-options page has an active text field.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_text_focused(&self) -> bool {
         self.rules.as_ref().is_some_and(RulesScreen::typing)
             || (self.view == View::Options && self.lan && self.port.focused)
@@ -453,6 +454,7 @@ impl Restrictions {
 }
 
 impl Game<'_> {
+    #[cfg(target_os = "ios")]
     pub(super) fn world_options_mobile_text_focused(&self) -> bool {
         self.world_options
             .as_ref()

@@ -15,16 +15,71 @@ pub(super) struct MobileState {
     observed_frame: u64,
     frame_ms: Vec<f32>,
     samples: Vec<serde_json::Value>,
+    reports: Option<std::sync::mpsc::SyncSender<PerformanceSnapshot>>,
     setup_requested: bool,
     setup_visible: bool,
-    import: Option<Receiver<std::result::Result<String, String>>>,
+    resources_changed: bool,
+    pending_resource_import: bool,
+    import: Option<Receiver<std::result::Result<ImportResult, String>>>,
+    export: Option<Receiver<std::result::Result<PathBuf, String>>>,
+}
+
+struct ImportResult {
+    message: String,
+    resources_changed: bool,
+    refresh_worlds: bool,
+}
+
+enum SetupWorkResult {
+    Message(String),
+    Backup(PathBuf),
+}
+
+struct PerformanceSnapshot {
+    frames: Vec<f32>,
+    samples: Vec<serde_json::Value>,
+    render_distance: i32,
+    simulation_distance: i32,
+}
+
+fn report_writer(path: PathBuf) -> std::sync::mpsc::SyncSender<PerformanceSnapshot> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PerformanceSnapshot>(1);
+    std::thread::spawn(move || {
+        while let Ok(snapshot) = rx.recv() {
+            let result = (|| -> Result<()> {
+                use std::io::Write;
+                let stage = path.with_extension("json.tmp");
+                let mut file = File::create(&stage)?;
+                serde_json::to_writer(
+                    &mut file,
+                    &serde_json::json!({
+                        "schema": 1, "scope": "physical-device-measurement-required",
+                        "status": "unreviewed", "frames": snapshot.frames,
+                        "samples": snapshot.samples,
+                        "render_distance": snapshot.render_distance,
+                        "simulation_distance": snapshot.simulation_distance,
+                        "automatic_quality_reduction": false
+                    }),
+                )?;
+                file.flush()?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(stage, &path)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                log::warn!("iPad performance report: {error}");
+            }
+        }
+    });
+    tx
 }
 
 pub(super) struct Setup {
     config: LaunchConfig,
     window: Option<Arc<Window>>,
     gpu: Option<BootstrapGpu>,
-    worker: Option<Receiver<std::result::Result<String, String>>>,
+    worker: Option<Receiver<std::result::Result<SetupWorkResult, String>>>,
     message: String,
     suspended: bool,
     smoke: bool,
@@ -150,13 +205,27 @@ impl Setup {
             return None;
         }
         self.ticks += 1;
-        if let Some(worker) = &self.worker {
-            match worker.try_recv() {
+        if let Some(completion) = self.worker.as_ref().map(Receiver::try_recv) {
+            match completion {
                 Ok(result) => {
                     self.worker = None;
-                    self.message = result.unwrap_or_else(|e| {
-                        format!("Import failed; the previous installation is preserved.\n{e}")
-                    });
+                    match result {
+                        Ok(SetupWorkResult::Message(message)) => self.message = message,
+                        Ok(SetupWorkResult::Backup(path)) => {
+                            self.message = "Backup ready. Choose where to save it.".into();
+                            self.update_panel();
+                            if let Some(window) = &self.window
+                                && let Err(error) = platform::share_file(window.as_ref(), &path)
+                            {
+                                self.fail(&error);
+                            }
+                        }
+                        Err(error) => {
+                            self.message = format!(
+                                "The operation failed; your existing data is preserved.\n{error}"
+                            );
+                        }
+                    }
                     self.update_panel();
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -241,7 +310,7 @@ impl Setup {
                             }
                         })()
                         .map_err(|e| e.to_string());
-                        let _ = tx.send(result);
+                        let _ = tx.send(result.map(SetupWorkResult::Message));
                     });
                 }
                 Event::Play | Event::Benchmark if self.ready() && self.worker.is_none() => {
@@ -251,26 +320,16 @@ impl Setup {
                         Err(error) => self.fail(&error.to_string()),
                     }
                 }
-                Event::Share => {
-                    let path = self
-                        .config
-                        .paths
-                        .documents
-                        .join("horizon-ipad-diagnostics.json");
-                    let m = platform::metrics();
-                    let _ = std::fs::write(
-                        &path,
-                        serde_json::json!({"schema":1,"system_version":m.system_version,
-                        "thermal_state":m.thermal_state,"resident_bytes":m.resident_bytes,
-                        "evidence":"setup-only; no gameplay or performance acceptance"})
-                        .to_string(),
-                    );
-                    if let Some(window) = &self.window {
-                        if let Err(error) = platform::share_file(window.as_ref(), &path) {
-                            self.fail(&error);
+                Event::EditTouch if self.ready() && self.worker.is_none() => {
+                    match self.loading(false) {
+                        Ok(mut loading) => {
+                            loading.mobile_edit_touch = true;
+                            return Some(loading);
                         }
+                        Err(error) => self.fail(&error.to_string()),
                     }
                 }
+                Event::Share if self.worker.is_none() => self.start_backup(),
                 Event::Error(error) => self.fail(&error),
                 _ => {}
             }
@@ -282,6 +341,35 @@ impl Setup {
             Instant::now() + Duration::from_millis(16),
         ));
         None
+    }
+    fn start_backup(&mut self) {
+        let metrics = platform::metrics();
+        let report = serde_json::json!({
+            "schema": 1,
+            "system_version": metrics.system_version,
+            "thermal_state": metrics.thermal_state,
+            "resident_bytes": metrics.resident_bytes,
+            "evidence": "setup-only; no gameplay or performance acceptance"
+        });
+        let documents = self.config.paths.documents.clone();
+        let config = self.config.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worker = Some(rx);
+        self.message = "Preparing diagnostics and world backups…".into();
+        self.update_panel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::result::Result<SetupWorkResult, String> {
+                std::fs::write(
+                    documents.join("horizon-ipad-diagnostics.json"),
+                    report.to_string(),
+                )
+                .map_err(|error| error.to_string())?;
+                export_backups(&config)
+                    .map(SetupWorkResult::Backup)
+                    .map_err(|error| error.to_string())
+            })();
+            let _ = tx.send(result);
+        });
     }
     fn loading(&mut self, benchmark: bool) -> Result<Loading> {
         let mut options = Options::read()?.ok_or("No launch options")?;
@@ -438,35 +526,40 @@ pub(super) fn poll_loading(loading: &mut Loading) -> Result<()> {
 
 /// Only called after the live world has closed and its writer has flushed.
 /// World originals remain read-only; the user chooses the share destination.
-fn export_backups() -> Result<PathBuf> {
+fn export_backups(config: &LaunchConfig) -> Result<PathBuf> {
     use std::io::{Read, Write};
-    let sandbox = PathBuf::from(std::env::var_os("HOME").ok_or("Missing application sandbox")?);
-    let config = LaunchConfig::ipad(&sandbox);
     let output = config.paths.documents.join("Horizon-backup.zip");
     let stage = output.with_extension("zip.tmp");
     let mut bundle = zip::ZipWriter::new(File::create(&stage)?);
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for entry in std::fs::read_dir(config.paths.home.join("saves"))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() || !entry.path().join("level.dat").is_file() {
-            continue;
+    match std::fs::read_dir(config.paths.home.join("saves")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() || !entry.path().join("level.dat").is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let temporary = config.paths.cache.join("world-export.zip");
+                let file = mobile_resources::export_world_archive(
+                    &entry.path(),
+                    &name,
+                    File::create(&temporary)?,
+                )?;
+                drop(file);
+                bundle.start_file(format!("worlds/{name}.zip"), options)?;
+                std::io::copy(&mut File::open(&temporary)?, &mut bundle)?;
+                std::fs::remove_file(temporary)?;
+            }
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let temporary = config.paths.cache.join("world-export.zip");
-        let file = mobile_resources::export_world_archive(
-            &entry.path(),
-            &name,
-            File::create(&temporary)?,
-        )?;
-        drop(file);
-        bundle.start_file(format!("worlds/{name}.zip"), options)?;
-        std::io::copy(&mut File::open(&temporary)?, &mut bundle)?;
-        std::fs::remove_file(temporary)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     for name in [
         "horizon-ipad-performance.json",
         "horizon-ipad-diagnostics.json",
+        "horizon-ios-smoke.json",
     ] {
         if let Ok(mut file) = File::open(config.paths.documents.join(name)) {
             let mut bytes = Vec::new();
@@ -481,6 +574,38 @@ fn export_backups() -> Result<PathBuf> {
 }
 
 impl Game<'_> {
+    /// A release from one device cannot release a mapping held by another.
+    /// Only iPad merges these sources; desktop input behavior is unchanged.
+    pub(super) fn mobile_input_held(
+        &self,
+        input: std::result::Result<KeyCode, MouseButton>,
+    ) -> bool {
+        if !self.focused || self.mobile.suspended || self.mobile_owns_input() {
+            return false;
+        }
+        let touch = match input {
+            Ok(key) => self.touch_holds_default_key(key),
+            Err(button) => self.touch_holds_mouse(button),
+        };
+        touch
+            || self
+                .physical_keys
+                .iter()
+                .any(|key| self.settings.keys.translate(*key) == Some(input))
+            || self
+                .physical_mouse
+                .iter()
+                .any(|button| self.settings.keys.translate_mouse(*button) == Some(input))
+            || self.mobile_pad_holds_input(input)
+    }
+
+    /// Native file operations own the input until the saved title screen is
+    /// returned to the game. Physical controllers must not open a world while
+    /// a backup worker is reading its files.
+    pub(super) fn mobile_owns_input(&self) -> bool {
+        self.mobile.setup_requested || self.mobile.setup_visible
+    }
+
     pub(super) fn mobile_suspend(&mut self, event_loop: &ActiveEventLoop) {
         if self.mobile.suspended {
             return;
@@ -492,6 +617,8 @@ impl Game<'_> {
         self.focused = false;
         self.keys.clear();
         self.physical_keys.clear();
+        self.physical_mouse.clear();
+        self.mobile_reset_pad();
         self.left = false;
         self.right = false;
         self.toggles = Default::default();
@@ -573,57 +700,223 @@ impl Game<'_> {
         if self.mobile.suspended {
             return;
         }
-        if let Err(e) = self.touch_tick(event_loop) {
+        if self.touch_editor.is_none()
+            && let Err(e) = self.touch_tick(event_loop)
+        {
             log::warn!("Touch gesture: {e}");
         }
         if let Some(window) = &self.window {
-            platform::setup_accessory(window.as_ref());
-        }
-        if self.mobile.setup_requested && self.pending_save.is_none() && self.title.is_some() {
-            self.mobile.setup_requested = false;
-            self.mobile.setup_visible = true;
-            if let Some(window) = &self.window {
-                let _ = platform::show_setup(
-                    window.as_ref(),
-                    "Your world has been saved. Import a world, share a backup, or return to the game. Resource changes take effect after reopening Horizon.",
-                    true,
-                );
+            if self.touch_editor.is_none() && !self.mobile_owns_input() {
+                platform::setup_accessory(window.as_ref());
+            } else {
+                platform::hide_accessory(window.as_ref());
             }
         }
-        if let Some(import) = &self.mobile.import {
-            if let Ok(result) = import.try_recv() {
-                self.mobile.import = None;
-                let message = result
-                    .unwrap_or_else(|e| format!("Import failed; existing data was preserved. {e}"));
-                if let Some(window) = &self.window {
-                    let _ = platform::show_setup(window.as_ref(), &message, true);
+        if self.mobile.setup_requested
+            && self.pending_save.is_none()
+            && self.world_loader.is_none()
+            && self.rest_loader.is_none()
+        {
+            if self.title.is_none() {
+                if let Err(e) = self.close_world() {
+                    log::error!("Save before opening files: {e}");
+                    self.mobile.setup_requested = false;
                 }
-                // Refresh the title's world list after a successful world import.
-                self.title = Some(Title::new(
-                    std::env::current_dir().unwrap_or_default().join("saves"),
-                    &self.options.resources,
-                ));
+            } else {
+                self.mobile.setup_requested = false;
+                self.mobile.setup_visible = true;
+                if let Some(window) = &self.window {
+                    let message = if self.mobile.resources_changed {
+                        "Resources were updated. Close and reopen Horizon before playing or running the benchmark."
+                    } else {
+                        "Your world has been saved. Import a world, share a backup, or return to the game."
+                    };
+                    let ready = !self.mobile.resources_changed
+                        && self.mobile.import.is_none()
+                        && self.mobile.export.is_none();
+                    let _ = platform::show_setup(window.as_ref(), message, ready);
+                }
             }
         }
-        for event in platform::poll_events() {
-            match event {
-                Event::ShowSetup => {
-                    self.mobile.setup_requested = true;
-                    if self.title.is_none() && self.pending_save.is_none() {
-                        if let Err(e) = self.close_world() {
-                            log::error!("Save before opening files: {e}");
-                            self.mobile.setup_requested = false;
+        if let Some(completion) = self.mobile.import.as_ref().map(Receiver::try_recv) {
+            match completion {
+                Ok(result) => {
+                    self.mobile.import = None;
+                    self.mobile.pending_resource_import = false;
+                    let message = match result {
+                        Ok(import) => {
+                            if import.resources_changed {
+                                self.mobile.resources_changed = true;
+                            }
+                            if import.refresh_worlds {
+                                self.title = Some(Title::new(
+                                    std::env::current_dir().unwrap_or_default().join("saves"),
+                                    &self.options.resources,
+                                ));
+                            }
+                            import.message
+                        }
+                        Err(error) => {
+                            format!("Import failed; existing data was preserved. {error}")
+                        }
+                    };
+                    if let Some(window) = &self.window {
+                        let ready = !self.mobile.resources_changed && self.mobile.export.is_none();
+                        let _ = platform::show_setup(window.as_ref(), &message, ready);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mobile.import = None;
+                    if self.mobile.pending_resource_import {
+                        self.mobile.resources_changed = true;
+                    }
+                    self.mobile.pending_resource_import = false;
+                    if let Some(window) = &self.window {
+                        let ready = !self.mobile.resources_changed && self.mobile.export.is_none();
+                        let _ = platform::show_setup(
+                            window.as_ref(),
+                            if self.mobile.resources_changed {
+                                "The resource import ended without a result. Close and reopen Horizon before playing to refresh its resource state."
+                            } else {
+                                "The import stopped before reporting a result. Existing data was preserved."
+                            },
+                            ready,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(completion) = self.mobile.export.as_ref().map(Receiver::try_recv) {
+            match completion {
+                Ok(result) => {
+                    self.mobile.export = None;
+                    match result {
+                        Ok(path) => {
+                            if let Some(window) = &self.window {
+                                let _ = platform::show_setup(
+                                    window.as_ref(),
+                                    "Backup ready. Choose where to save it.",
+                                    !self.mobile.resources_changed && self.mobile.import.is_none(),
+                                );
+                                if let Err(error) = platform::share_file(window.as_ref(), &path) {
+                                    log::error!("Share backup: {error}");
+                                    let _ = platform::show_setup(
+                                        window.as_ref(),
+                                        &format!(
+                                            "Backup is ready, but the share sheet could not open: {error}"
+                                        ),
+                                        !self.mobile.resources_changed
+                                            && self.mobile.import.is_none(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(window) = &self.window {
+                                let _ = platform::show_setup(
+                                    window.as_ref(),
+                                    &format!("Backup export failed: {error}"),
+                                    !self.mobile.resources_changed && self.mobile.import.is_none(),
+                                );
+                            }
                         }
                     }
                 }
-                Event::Play if self.mobile.setup_visible && self.mobile.import.is_none() => {
-                    self.mobile.setup_visible = false;
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mobile.export = None;
                     if let Some(window) = &self.window {
-                        platform::hide_setup(window.as_ref());
+                        let _ = platform::show_setup(
+                            window.as_ref(),
+                            "Backup export stopped before completion.",
+                            !self.mobile.resources_changed && self.mobile.import.is_none(),
+                        );
                     }
                 }
+            }
+        }
+        for event in platform::poll_events() {
+            if self.touch_editor.is_some() {
+                match event {
+                    Event::AudioInterrupted => {
+                        self.mobile.interrupted = true;
+                        self.audio.pause();
+                    }
+                    Event::AudioResume | Event::AudioRouteChanged => {
+                        self.mobile.interrupted = false;
+                        if let Err(e) = platform::audio_active(true) {
+                            log::warn!("Audio route: {e}");
+                        }
+                        self.audio.reload(&self.options.resources);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match event {
+                Event::ShowSetup => {
+                    if let Err(error) = self.cancel_touch_input(event_loop) {
+                        log::warn!("Touch release before opening Files: {error}");
+                    }
+                    self.keys.clear();
+                    self.physical_keys.clear();
+                    self.physical_mouse.clear();
+                    self.mobile_reset_pad();
+                    self.pending_entry = None;
+                    if let Some(loader) = self.world_loader.take() {
+                        self.world_loader = Some(if loader.cancelled {
+                            loader
+                        } else {
+                            loader.cancel()
+                        });
+                    }
+                    self.left = false;
+                    self.right = false;
+                    self.capture(false);
+                    self.mobile.setup_requested = true;
+                }
+                Event::Play if self.mobile.setup_visible => {
+                    if self.mobile.resources_changed {
+                        if let Some(window) = &self.window {
+                            let _ = platform::show_setup(
+                                window.as_ref(),
+                                "Resources were updated. Close and reopen Horizon before playing or running the benchmark.",
+                                false,
+                            );
+                        }
+                    } else if self.mobile.import.is_none() && self.mobile.export.is_none() {
+                        self.mobile.setup_visible = false;
+                        if let Some(window) = &self.window {
+                            platform::hide_setup(window.as_ref());
+                        }
+                    }
+                }
+                Event::Benchmark if self.mobile.setup_visible => {
+                    if self.mobile.resources_changed {
+                        if let Some(window) = &self.window {
+                            let _ = platform::show_setup(
+                                window.as_ref(),
+                                "Resources were updated. Close and reopen Horizon before playing or running the benchmark.",
+                                false,
+                            );
+                        }
+                    } else if self.mobile.import.is_none() && self.mobile.export.is_none() {
+                        self.mobile_start_benchmark();
+                    }
+                }
+                Event::EditTouch
+                    if self.mobile.setup_visible
+                        && self.mobile.import.is_none()
+                        && self.mobile.export.is_none() =>
+                {
+                    self.mobile.setup_visible = false;
+                    self.begin_touch_edit();
+                }
                 Event::ImportResources | Event::ImportWorld
-                    if self.mobile.setup_visible && self.mobile.import.is_none() =>
+                    if self.mobile.setup_visible
+                        && self.mobile.import.is_none()
+                        && self.mobile.export.is_none() =>
                 {
                     let kind = if matches!(event, Event::ImportWorld) {
                         PickKind::World
@@ -637,7 +930,9 @@ impl Game<'_> {
                     }
                 }
                 Event::Picked { path, kind }
-                    if self.mobile.setup_visible && self.mobile.import.is_none() =>
+                    if self.mobile.setup_visible
+                        && self.mobile.import.is_none()
+                        && self.mobile.export.is_none() =>
                 {
                     let resources = std::env::var_os("HOME")
                         .map(PathBuf::from)
@@ -646,6 +941,7 @@ impl Game<'_> {
                     let saves = std::env::current_dir().unwrap_or_default().join("saves");
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.mobile.import = Some(rx);
+                    self.mobile.pending_resource_import = kind == PickKind::Resources;
                     if let Some(window) = &self.window {
                         let _ = platform::show_setup(
                             window.as_ref(),
@@ -654,32 +950,35 @@ impl Game<'_> {
                         );
                     }
                     std::thread::spawn(move || {
-                        let result = (|| -> Result<String> {
+                        let result = (|| -> Result<ImportResult> {
                             if kind == PickKind::Resources {
                                 mobile_resources::recover_import_transaction(&resources)?;
                                 mobile_resources::import_resources_from_path(&path, &resources)?;
-                                Ok("Resources updated. Close and reopen Horizon before playing with them.".into())
+                                Ok(ImportResult {
+                                    message: "Resources updated. Close and reopen Horizon before playing with them.".into(),
+                                    resources_changed: true,
+                                    refresh_worlds: false,
+                                })
                             } else {
                                 let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
                                 let destination = saves.join(format!("Imported-{stamp}"));
                                 mobile_resources::import_world_archive(File::open(path)?, &destination)?;
-                                Ok("World imported. Return to the game to open it.".into())
+                                Ok(ImportResult {
+                                    message: "World imported. Return to the game to open it.".into(),
+                                    resources_changed: false,
+                                    refresh_worlds: true,
+                                })
                             }
                         })().map_err(|e| e.to_string());
                         let _ = tx.send(result);
                     });
                 }
-                Event::Share if self.mobile.setup_visible && self.mobile.import.is_none() => {
-                    if let Some(window) = &self.window {
-                        match export_backups() {
-                            Ok(path) => {
-                                if let Err(e) = platform::share_file(window.as_ref(), &path) {
-                                    log::error!("Share backup: {e}");
-                                }
-                            }
-                            Err(e) => log::error!("Backup export: {e}"),
-                        }
-                    }
+                Event::Share
+                    if self.mobile.setup_visible
+                        && self.mobile.import.is_none()
+                        && self.mobile.export.is_none() =>
+                {
+                    self.mobile_start_backup()
                 }
                 Event::Text(text) => {
                     if let Err(e) = self.mobile_text(&text) {
@@ -751,7 +1050,7 @@ impl Game<'_> {
                 _ => {}
             }
         }
-        let wants = self.mobile_wants_keyboard();
+        let wants = self.touch_editor.is_none() && self.mobile_wants_keyboard();
         if wants != self.mobile.keyboard {
             if let Some(window) = &self.window {
                 platform::keyboard(window.as_ref(), wants);
@@ -795,20 +1094,119 @@ impl Game<'_> {
         }
         let _ = event_loop;
     }
-    fn write_mobile_report(&self) {
+    fn mobile_start_benchmark(&mut self) {
+        if self.title.is_none() || self.renderer.is_none() {
+            if let Some(window) = &self.window {
+                let _ = platform::show_setup(
+                    window.as_ref(),
+                    "Return to the saved title screen before starting the benchmark.",
+                    true,
+                );
+            }
+            return;
+        }
+        self.settings.vsync = false;
+        self.settings.max_fps = 260;
+        self.settings.inactivity_fps_limit = "minimized".into();
+        self.options.no_pause = true;
+        self.apply_settings();
+        let game_dir = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                if let Some(window) = &self.window {
+                    let _ = platform::show_setup(
+                        window.as_ref(),
+                        &format!("The benchmark could not start: {error}"),
+                        true,
+                    );
+                }
+                return;
+            }
+        };
+        let control = self
+            .control
+            .get_or_insert_with(horizon_client::control::Server::local);
+        horizon_client::benchmark::start(
+            control.sender(),
+            horizon_client::benchmark::Setup {
+                scenario: "standard".into(),
+                started: self.started,
+                app: horizon_bench::App {
+                    name: "horizon-client".into(),
+                    version: horizon_client::crash::version(),
+                    commit: option_env!("HORIZON_COMMIT").map(str::to_owned),
+                    mods: Vec::new(),
+                },
+                simulation_distance: self.settings.simulation_distance as u32,
+                vsync: false,
+                fps_cap: None,
+                offscreen: self.options.offscreen,
+                game_dir,
+            },
+        );
+        self.mobile.setup_visible = false;
+        if let Some(window) = &self.window {
+            platform::hide_setup(window.as_ref());
+        }
+    }
+    fn mobile_start_backup(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            if let Some(window) = &self.window {
+                let _ = platform::show_setup(
+                    window.as_ref(),
+                    "Backup export failed: the application sandbox is unavailable.",
+                    !self.mobile.resources_changed,
+                );
+            }
+            return;
+        };
+        let config = LaunchConfig::ipad(&home);
+        let metrics = platform::metrics();
+        let report = serde_json::json!({
+            "schema": 1,
+            "system_version": metrics.system_version,
+            "thermal_state": metrics.thermal_state,
+            "resident_bytes": metrics.resident_bytes,
+            "evidence": "gameplay; physical-device performance acceptance not claimed"
+        });
+        let documents = config.paths.documents.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.mobile.export = Some(rx);
+        if let Some(window) = &self.window {
+            let _ = platform::show_setup(
+                window.as_ref(),
+                "Preparing diagnostics and world backups…",
+                false,
+            );
+        }
+        std::thread::spawn(move || {
+            let result = (|| -> std::result::Result<PathBuf, String> {
+                std::fs::write(
+                    documents.join("horizon-ipad-diagnostics.json"),
+                    report.to_string(),
+                )
+                .map_err(|error| error.to_string())?;
+                export_backups(&config).map_err(|error| error.to_string())
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    fn write_mobile_report(&mut self) {
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };
         let path = PathBuf::from(home).join("Documents/horizon-ipad-performance.json");
-        let report = serde_json::json!({"schema":1,"scope":"physical-device-measurement-required",
-            "status":"unreviewed","frames":self.mobile.frame_ms,"samples":self.mobile.samples,
-            "render_distance":self.settings.render_distance,"simulation_distance":self.settings.simulation_distance,
-            "automatic_quality_reduction":false});
-        if let Ok(bytes) = serde_json::to_vec(&report) {
-            let stage = path.with_extension("json.tmp");
-            if std::fs::write(&stage, bytes).is_ok() {
-                let _ = std::fs::rename(stage, path);
-            }
-        }
+        let writer = self
+            .mobile
+            .reports
+            .get_or_insert_with(|| report_writer(path));
+        // Serialization and disk I/O stay off the render thread. A bounded
+        // queue prevents slow storage from accumulating pending snapshots.
+        let _ = writer.try_send(PerformanceSnapshot {
+            frames: self.mobile.frame_ms.clone(),
+            samples: self.mobile.samples.clone(),
+            render_distance: self.settings.render_distance,
+            simulation_distance: self.settings.simulation_distance,
+        });
     }
 }

@@ -5,8 +5,10 @@ use horizon_client::{
     clipboard::{self, AppendSelection, SystemClipboard},
     options_ui::{Event, OptionsUi, Page},
 };
+#[cfg(target_os = "ios")]
+use winit::event::TouchPhase;
 use winit::{
-    event::{ElementState, KeyEvent, TouchPhase},
+    event::{ElementState, KeyEvent},
     keyboard::{KeyCode, ModifiersState},
 };
 
@@ -105,6 +107,7 @@ impl StartupMenu {
     }
 
     /// Route committed native text to the already focused title/options field.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_text(&mut self, atlas: &horizon_client::hud::HudAtlas, text: &str) {
         if !self.mobile_wants_keyboard() || text.is_empty() {
             return;
@@ -126,6 +129,7 @@ impl StartupMenu {
 
     /// Backspace in the focused native text field, using the same selection
     /// and cursor handling as the physical-key route.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_backspace(
         &mut self,
         settings: &mut Settings,
@@ -153,6 +157,7 @@ impl StartupMenu {
     }
 
     /// Enter in the focused title/options view.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_enter(
         &mut self,
         settings: &mut Settings,
@@ -172,6 +177,7 @@ impl StartupMenu {
 
     /// Only show the native keyboard when a text field has actually taken
     /// focus; title screens also contain many non-text controls.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_wants_keyboard(&mut self) -> bool {
         if self.pending.is_some() {
             return false;
@@ -184,6 +190,7 @@ impl StartupMenu {
             .is_some_and(|title| title.focused_field().is_some())
     }
 
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_touch(
         &mut self,
         id: u64,
@@ -321,6 +328,7 @@ impl StartupMenu {
     }
 }
 
+#[cfg(target_os = "ios")]
 pub(super) enum MobileTouchAction {
     Move([f64; 2]),
     Button(ElementState),
@@ -532,6 +540,7 @@ impl Loading {
 
     /// Drop menu drag state after UIKit cancels a touch sequence. Do not send
     /// a synthetic click release, which could complete a half-finished action.
+    #[cfg(target_os = "ios")]
     pub(super) fn mobile_cancel_touch_drag(&mut self) {
         self.menu.cancel_mobile_touch();
         self.menu.dragging = false;
