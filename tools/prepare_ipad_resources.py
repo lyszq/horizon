@@ -20,6 +20,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import NoReturn
 import zipfile
 
@@ -34,6 +35,8 @@ MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_FILES = 250_000
+MAX_TOTAL_PATH_BYTES = 64 * 1024 * 1024
+MAX_PREFIX_BYTES = 32 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 300
 COPY_CHUNK = 1024 * 1024
 SKIP_ROOT = {"classes", "client-classes", "export.log", "model-state-export.log", TRANSFER_NAME}
@@ -138,19 +141,28 @@ def _validate_member_set(infos: list[zipfile.ZipInfo]) -> tuple[dict[str, zipfil
     folded: dict[str, str] = {}
     kinds: dict[str, bool] = {}
     total = 0
+    total_path_bytes = 0
+    prefix_bytes = 0
     for info in infos:
         mode = (info.external_attr >> 16) & 0xFFFF
         file_type = stat.S_IFMT(mode)
         is_dir = info.is_dir() or file_type == stat.S_IFDIR
         name = safe_relative_path(info.filename, is_dir)
+        total_path_bytes += len(name.encode("utf-8"))
+        if total_path_bytes > MAX_TOTAL_PATH_BYTES:
+            fail("archive contains too much path metadata")
         canonical = name.lower()
         if canonical in actual:
             fail(f"duplicate archive path: {info.filename}")
         actual[canonical] = info
         kinds[canonical] = is_dir
-        for index in range(1, len(name.split("/")) + 1):
-            prefix = "/".join(name.split("/")[:index])
+        prefix = ""
+        for part in name.split("/"):
+            prefix = f"{prefix}/{part}" if prefix else part
             key = prefix.lower()
+            prefix_bytes += len(prefix.encode("utf-8")) + len(key.encode("utf-8"))
+            if prefix_bytes > MAX_PREFIX_BYTES:
+                fail("archive contains too much path-prefix metadata")
             prior = folded.get(key)
             if prior is not None and prior != prefix:
                 fail(f"case-colliding archive paths: {prior!r} and {prefix!r}")
@@ -173,8 +185,9 @@ def _validate_member_set(infos: list[zipfile.ZipInfo]) -> tuple[dict[str, zipfil
         if is_dir:
             continue
         parts = key.split("/")
-        for index in range(1, len(parts)):
-            parent = "/".join(parts[:index])
+        parent = ""
+        for part in parts[:-1]:
+            parent = f"{parent}/{part}" if parent else part
             if parent in kinds and not kinds[parent]:
                 fail(f"archive file is also used as a parent directory: {parent}")
     return actual, total
@@ -296,6 +309,7 @@ def validate_transfer_archive(path: Path) -> tuple[int, int]:
 def _runtime_files(root: Path) -> list[tuple[str, Path]]:
     files: list[tuple[str, Path]] = []
     total = 0
+    total_path_bytes = 0
     for current, dirs, names in os.walk(root, followlinks=False):
         current_path = Path(current)
         rel_dir = current_path.relative_to(root)
@@ -318,6 +332,9 @@ def _runtime_files(root: Path) -> list[tuple[str, Path]]:
                 fail(f"prepared resources contain a link or special file: {path}")
             relative = path.relative_to(root).as_posix()
             safe_relative_path(relative)
+            total_path_bytes += len(relative.encode("utf-8"))
+            if total_path_bytes > MAX_TOTAL_PATH_BYTES:
+                fail("prepared resources contain too much path metadata")
             size = path.stat().st_size
             if size > MAX_FILE_BYTES:
                 fail(f"prepared resource exceeds per-file size limit: {relative}")
@@ -362,7 +379,11 @@ def validate_prepared_folder(path: Path) -> list[tuple[str, Path]]:
 def package_resources(prepared: Path, output: Path) -> tuple[int, int, str]:
     """Build a verified transfer ZIP beside output, preserving any previous output on failure."""
     prepared = prepared.resolve()
-    output = output.resolve()
+    output = output.expanduser().absolute()
+    if output.is_symlink():
+        fail("transfer archive output must not be a symbolic link")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output = output.parent.resolve() / output.name
     try:
         output.relative_to(prepared)
     except ValueError:
@@ -370,11 +391,13 @@ def package_resources(prepared: Path, output: Path) -> tuple[int, int, str]:
     else:
         fail("transfer archive output must be outside the prepared resources folder")
     files = validate_prepared_folder(prepared)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.partial")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".partial", dir=output.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     hashes: dict[str, dict[str, object]] = {}
     try:
-        temporary.unlink(missing_ok=True)
         with zipfile.ZipFile(temporary, "w", allowZip64=True) as archive:
             for name, source in files:
                 method = zipfile.ZIP_STORED if source.suffix.lower() in {
@@ -404,10 +427,24 @@ def package_resources(prepared: Path, output: Path) -> tuple[int, int, str]:
         if temporary.stat().st_size > MAX_ARCHIVE_BYTES:
             fail("transfer archive exceeds compressed size limit")
         file_count, total = validate_transfer_archive(temporary)
+        with temporary.open("rb+") as packaged:
+            os.fsync(packaged.fileno())
         os.replace(temporary, output)
+        _sync_directory(output.parent)
         return file_count, total, sha256_file(output)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _sync_directory(path: Path) -> None:
+    """Persist a completed rename on Unix filesystems that support directory fsync."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _check_java25(java_home: Path) -> None:
@@ -441,6 +478,15 @@ def _within_local(path: Path, root: Path) -> Path:
     return resolved
 
 
+def _horizon_prepare_command(root: Path, *arguments: str) -> list[str]:
+    """Invoke horizon-prepare directly so asset subcommands stay in argv[1]."""
+    beside = root / ("horizon-prepare.exe" if os.name == "nt" else "horizon-prepare")
+    prefix = [str(beside)] if beside.is_file() else [
+        "cargo", "run", "--quiet", "--release", "-p", "horizon-prepare", "--",
+    ]
+    return [*prefix, *arguments, "--root", str(root)]
+
+
 def _run_preparation(root: Path, args: argparse.Namespace) -> Path:
     minecraft = (args.minecraft_dir or default_minecraft_dir()).expanduser().resolve()
     server = args.server_jar
@@ -464,8 +510,12 @@ def _run_preparation(root: Path, args: argparse.Namespace) -> Path:
     command = [sys.executable, str(wrapper), "--prepare", "--minecraft-dir", str(minecraft),
                "--server-jar", str(server)]
     subprocess.run(command, cwd=root, env=environment, check=True)
-    subprocess.run([sys.executable, str(wrapper), "sounds", "--minecraft-dir", str(minecraft)],
-                   cwd=root, env=environment, check=True)
+    subprocess.run(
+        _horizon_prepare_command(root, "sounds", "--minecraft-dir", str(minecraft)),
+        cwd=root,
+        env=environment,
+        check=True,
+    )
     return root / ".local" / "horizon-client" / VERSION
 
 

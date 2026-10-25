@@ -8,7 +8,7 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -24,6 +24,8 @@ const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FILES: usize = 250_000;
+const MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PREFIX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO: u64 = 300;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -101,7 +103,11 @@ pub fn import_resources<R: Read + Seek>(
     destination: &Path,
 ) -> crate::Result<ResourceImportReport> {
     check_archive_length(&mut reader, RESOURCE_LIMITS)?;
+    let central_entries = validate_central_directory(&mut reader, RESOURCE_LIMITS)?;
     let mut archive = ZipArchive::new(reader)?;
+    if archive.len() != central_entries {
+        return Err(invalid("ZIP reader omitted or merged central-directory entries").into());
+    }
     let mut report = None;
     replace_directory(destination, true, |stage| {
         report = Some(extract_resources(&mut archive, stage)?);
@@ -293,7 +299,11 @@ pub fn import_world_archive<R: Read + Seek>(
     destination: &Path,
 ) -> crate::Result<WorldImportReport> {
     check_archive_length(&mut reader, WORLD_LIMITS)?;
+    let central_entries = validate_central_directory(&mut reader, WORLD_LIMITS)?;
     let mut archive = ZipArchive::new(reader)?;
+    if archive.len() != central_entries {
+        return Err(invalid("ZIP reader omitted or merged central-directory entries").into());
+    }
     let mut report = None;
     replace_directory(destination, false, |stage| {
         report = Some(extract_world(&mut archive, stage)?);
@@ -476,6 +486,7 @@ fn preflight<R: Read + Seek>(
     let mut names = HashMap::<String, (String, bool)>::new();
     let mut prefixes = HashMap::<String, String>::new();
     let mut total = 0u64;
+    let mut prefix_bytes = 0usize;
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
         let name = file.name().to_owned();
@@ -493,16 +504,27 @@ fn preflight<R: Read + Seek>(
             return Err(invalid("archive contains duplicate paths").into());
         }
         let parts: Vec<_> = normalized.split('/').collect();
-        for count in 1..=parts.len() {
-            let prefix = parts[..count].join("/");
+        let mut prefix = String::with_capacity(normalized.len());
+        for part in &parts {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
             let key = prefix.to_lowercase();
+            prefix_bytes = prefix_bytes
+                .checked_add(prefix.len())
+                .and_then(|bytes| bytes.checked_add(key.len()))
+                .ok_or_else(|| invalid("archive path metadata size overflow"))?;
+            if prefix_bytes > MAX_PREFIX_BYTES {
+                return Err(invalid("archive contains too much path-prefix metadata").into());
+            }
             if prefixes
                 .get(&key)
                 .is_some_and(|previous| previous != &prefix)
             {
                 return Err(invalid("archive contains case-colliding paths").into());
             }
-            prefixes.insert(key, prefix);
+            prefixes.entry(key).or_insert_with(|| prefix.clone());
         }
         let size = file.size();
         let compressed_size = file.compressed_size();
@@ -538,14 +560,177 @@ fn preflight<R: Read + Seek>(
     }
     for entry in &entries {
         let parts: Vec<_> = entry.folded.split('/').collect();
-        for count in 1..parts.len() {
-            let parent = parts[..count].join("/");
+        let mut parent = String::with_capacity(entry.folded.len());
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
             if names.get(&parent).is_some_and(|(_, is_dir)| !is_dir) {
                 return Err(invalid("archive file is also used as a parent directory").into());
             }
         }
     }
     Ok(entries)
+}
+
+/// Inspect the raw central directory before handing the archive to `zip`.
+///
+/// `ZipArchive` indexes entries by name and can expose only one of two entries when a crafted
+/// central directory repeats a path. This bounded pass checks the declared record count and every
+/// raw path first, so hidden duplicates cannot bypass the later extraction checks.
+fn validate_central_directory<R: Read + Seek>(
+    reader: &mut R,
+    limits: Limits,
+) -> crate::Result<usize> {
+    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+    const CENTRAL_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+    const EOCD_LEN: usize = 22;
+    const MAX_EOCD_TAIL: usize = EOCD_LEN + u16::MAX as usize;
+    const CENTRAL_HEADER_LEN: u64 = 46;
+
+    let archive_start = reader.stream_position()?;
+    let archive_end = reader.seek(SeekFrom::End(0))?;
+    let archive_len = archive_end.saturating_sub(archive_start);
+    if archive_len > limits.archive_bytes {
+        return Err(invalid("archive exceeds compressed size limit").into());
+    }
+    if archive_len < EOCD_LEN as u64 {
+        return Err(invalid("archive is missing its end-of-central-directory record").into());
+    }
+
+    let tail_len = archive_len.min(MAX_EOCD_TAIL as u64) as usize;
+    let tail_start = archive_end - tail_len as u64;
+    reader.seek(SeekFrom::Start(tail_start))?;
+    let mut tail = vec![0; tail_len];
+    reader.read_exact(&mut tail)?;
+
+    let eocd_index = (0..=tail.len() - EOCD_LEN)
+        .rev()
+        .find(|&index| {
+            if &tail[index..index + 4] != EOCD_SIGNATURE {
+                return false;
+            }
+            let comment_len = u16::from_le_bytes([tail[index + 20], tail[index + 21]]) as usize;
+            index + EOCD_LEN + comment_len == tail.len()
+        })
+        .ok_or_else(|| invalid("archive has no valid end-of-central-directory record"))?;
+    let eocd = &tail[eocd_index..eocd_index + EOCD_LEN];
+    let disk_number = u16::from_le_bytes([eocd[4], eocd[5]]);
+    let central_disk = u16::from_le_bytes([eocd[6], eocd[7]]);
+    let disk_entries = u16::from_le_bytes([eocd[8], eocd[9]]);
+    let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]);
+    let central_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]);
+    let central_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]);
+    if disk_number != 0 || central_disk != 0 || disk_entries != total_entries {
+        return Err(invalid("multi-disk ZIP archives are unsupported").into());
+    }
+    if total_entries == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
+        return Err(invalid("Zip64 archives are unsupported").into());
+    }
+    let total_entries = total_entries as usize;
+    if total_entries > limits.file_count {
+        return Err(invalid("archive contains too many entries").into());
+    }
+
+    let central_start = archive_start
+        .checked_add(central_offset as u64)
+        .ok_or_else(|| invalid("central-directory offset overflow"))?;
+    let central_end = central_start
+        .checked_add(central_size as u64)
+        .ok_or_else(|| invalid("central-directory size overflow"))?;
+    let eocd_start = tail_start + eocd_index as u64;
+    if central_start < archive_start || central_end != eocd_start || central_end > archive_end {
+        return Err(invalid("central directory has an invalid boundary").into());
+    }
+
+    let mut cursor = central_start;
+    let mut raw_names = HashSet::<String>::with_capacity(total_entries);
+    let mut total_path_bytes = 0usize;
+    for _ in 0..total_entries {
+        if cursor
+            .checked_add(CENTRAL_HEADER_LEN)
+            .is_none_or(|end| end > central_end)
+        {
+            return Err(invalid("central directory is truncated").into());
+        }
+        reader.seek(SeekFrom::Start(cursor))?;
+        let mut header = [0u8; CENTRAL_HEADER_LEN as usize];
+        reader.read_exact(&mut header)?;
+        if &header[..4] != CENTRAL_SIGNATURE {
+            return Err(invalid("central directory contains an invalid record").into());
+        }
+
+        let flags = u16::from_le_bytes([header[8], header[9]]);
+        let filename_len = u16::from_le_bytes([header[28], header[29]]) as usize;
+        let extra_len = u16::from_le_bytes([header[30], header[31]]) as usize;
+        let comment_len = u16::from_le_bytes([header[32], header[33]]) as usize;
+        let disk_start = u16::from_le_bytes([header[34], header[35]]);
+        let compressed_size = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+        let uncompressed_size =
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+        let local_offset = u32::from_le_bytes([header[42], header[43], header[44], header[45]]);
+        if filename_len == 0
+            || filename_len > 4096
+            || disk_start != 0
+            || compressed_size == u32::MAX
+            || uncompressed_size == u32::MAX
+            || local_offset == u32::MAX
+        {
+            return Err(invalid("central directory contains an unsupported entry").into());
+        }
+        let record_len = CENTRAL_HEADER_LEN
+            .checked_add(filename_len as u64)
+            .and_then(|len| len.checked_add(extra_len as u64))
+            .and_then(|len| len.checked_add(comment_len as u64))
+            .ok_or_else(|| invalid("central-directory record size overflow"))?;
+        let next = cursor
+            .checked_add(record_len)
+            .ok_or_else(|| invalid("central-directory record offset overflow"))?;
+        if next > central_end {
+            return Err(invalid("central-directory record is truncated").into());
+        }
+
+        let mut raw_name = vec![0; filename_len];
+        reader.read_exact(&mut raw_name)?;
+        total_path_bytes = total_path_bytes
+            .checked_add(filename_len)
+            .ok_or_else(|| invalid("archive path size overflow"))?;
+        if total_path_bytes > MAX_TOTAL_PATH_BYTES {
+            return Err(invalid("archive contains too much path metadata").into());
+        }
+        if flags & (1 << 11) == 0 && !raw_name.is_ascii() {
+            return Err(invalid("archive path is not encoded as UTF-8").into());
+        }
+        let name = std::str::from_utf8(&raw_name)
+            .map_err(|_| invalid("archive path is not valid UTF-8"))?;
+        let external_attributes =
+            u32::from_le_bytes([header[38], header[39], header[40], header[41]]);
+        let made_by_os = header[5];
+        let unix_mode = if made_by_os == 3 {
+            (external_attributes >> 16) as u16
+        } else {
+            0
+        };
+        let mode_type = unix_mode & 0o170000;
+        if !matches!(mode_type, 0 | 0o100000 | 0o040000) {
+            return Err(invalid("archive contains a symbolic link or special file").into());
+        }
+        let is_dir = name.ends_with('/') || mode_type == 0o040000;
+        let normalized = safe_member_name(name, is_dir)?;
+        let folded = normalized.to_lowercase();
+        if !raw_names.insert(folded) {
+            return Err(invalid("archive contains duplicate paths").into());
+        }
+
+        cursor = next;
+    }
+    if cursor != central_end {
+        return Err(invalid("central-directory record count does not match its size").into());
+    }
+
+    reader.seek(SeekFrom::Start(archive_start))?;
+    Ok(total_entries)
 }
 
 fn safe_member_name(name: &str, is_dir: bool) -> io::Result<String> {
@@ -702,22 +887,22 @@ fn replace_directory(
     {
         drop(journal);
         let _ = fs::remove_file(&paths.journal);
+        let _ = sync_parent(&paths.journal);
         return Err(error.into());
     }
     drop(journal);
-    sync_parent(&paths.destination);
+    sync_parent(&paths.journal)?;
     fs::create_dir(&paths.stage)?;
 
     if let Err(error) = populate(&paths.stage) {
-        let cleanup =
-            fs::remove_dir_all(&paths.stage).and_then(|_| fs::remove_file(&paths.journal));
+        let cleanup = remove_stage_and_journal(&paths);
         if let Err(cleanup_error) = cleanup {
             return Err(format!("{error}; import cleanup needs recovery: {cleanup_error}").into());
         }
         return Err(error);
     }
     sync_tree_directories(&paths.stage)?;
-    sync_parent(&paths.stage);
+    sync_parent(&paths.stage)?;
     let had_destination = path_exists(&paths.destination)?;
     if had_destination {
         if let Err(error) = fs::rename(&paths.destination, &paths.backup) {
@@ -726,7 +911,7 @@ fn replace_directory(
             }
             return Err(error.into());
         }
-        sync_parent(&paths.destination);
+        sync_parent(&paths.destination)?;
     }
     if let Err(error) = fs::rename(&paths.stage, &paths.destination) {
         if had_destination {
@@ -737,31 +922,42 @@ fn replace_directory(
                 )
                 .into());
             }
+            if let Err(sync_error) = sync_parent(&paths.destination) {
+                return Err(format!(
+                    "could not persist restoration of the previous directory ({sync_error}); recovery is pending"
+                )
+                .into());
+            }
         }
         if let Err(cleanup) = remove_stage_and_journal(&paths) {
             return Err(format!("{error}; import cleanup needs recovery: {cleanup}").into());
         }
-        sync_parent(&paths.destination);
         return Err(error.into());
     }
-    sync_parent(&paths.destination);
+    sync_parent(&paths.destination)?;
     // The commit point is the staging rename. Cleanup is recoverable and cannot invalidate the
     // now-active, fully verified directory.
-    match path_exists(&paths.backup) {
-        Ok(true) if fs::remove_dir_all(&paths.backup).is_ok() => {
-            let _ = fs::remove_file(&paths.journal);
-        }
-        Ok(false) => {
-            let _ = fs::remove_file(&paths.journal);
-        }
-        _ => {}
+    let backup_removed = match path_exists(&paths.backup) {
+        Ok(true) => fs::remove_dir_all(&paths.backup)
+            .and_then(|()| sync_parent(&paths.backup))
+            .is_ok(),
+        Ok(false) => true,
+        Err(_) => false,
+    };
+    if backup_removed && fs::remove_file(&paths.journal).is_ok() {
+        let _ = sync_parent(&paths.journal);
     }
-    sync_parent(&paths.destination);
     Ok(())
 }
 
 fn recover_transaction(paths: &TransactionPaths) -> crate::Result<()> {
     if !path_exists(&paths.journal)? {
+        if path_exists(&paths.stage)? || path_exists(&paths.backup)? {
+            return Err(invalid(
+                "stale import paths have no recovery journal; data was left untouched",
+            )
+            .into());
+        }
         return Ok(());
     }
     let journal_metadata = fs::symlink_metadata(&paths.journal)?;
@@ -797,31 +993,47 @@ fn recover_transaction(paths: &TransactionPaths) -> crate::Result<()> {
     let stage = path_exists(&paths.stage)?;
     let backup = path_exists(&paths.backup)?;
     match (active, stage, backup) {
-        (true, true, false) => fs::remove_dir_all(&paths.stage)?,
-        (true, false, true) => fs::remove_dir_all(&paths.backup)?,
+        (true, true, false) => {
+            fs::remove_dir_all(&paths.stage)?;
+            sync_parent(&paths.stage)?;
+        }
+        (true, false, true) => {
+            fs::remove_dir_all(&paths.backup)?;
+            sync_parent(&paths.backup)?;
+        }
         (true, true, true) => {
             return Err(invalid("ambiguous import state; active data was left untouched").into());
         }
         (false, true, true) => {
             fs::rename(&paths.backup, &paths.destination)?;
+            sync_parent(&paths.destination)?;
             fs::remove_dir_all(&paths.stage)?;
+            sync_parent(&paths.stage)?;
         }
-        (false, false, true) => fs::rename(&paths.backup, &paths.destination)?,
-        (false, true, false) => fs::remove_dir_all(&paths.stage)?,
+        (false, false, true) => {
+            fs::rename(&paths.backup, &paths.destination)?;
+            sync_parent(&paths.destination)?;
+        }
+        (false, true, false) => {
+            fs::remove_dir_all(&paths.stage)?;
+            sync_parent(&paths.stage)?;
+        }
         // This state is reached after the new directory has committed and the old backup was
         // already removed, but the process stopped before deleting the journal marker.
         (true, false, false) | (false, false, false) => {}
     }
     fs::remove_file(&paths.journal)?;
-    sync_parent(&paths.destination);
+    sync_parent(&paths.journal)?;
     Ok(())
 }
 
 fn remove_stage_and_journal(paths: &TransactionPaths) -> io::Result<()> {
     if path_exists(&paths.stage)? {
         fs::remove_dir_all(&paths.stage)?;
+        sync_parent(&paths.stage)?;
     }
-    fs::remove_file(&paths.journal)
+    fs::remove_file(&paths.journal)?;
+    sync_parent(&paths.journal)
 }
 
 fn ensure_real_directory(path: &Path) -> crate::Result<()> {
@@ -840,12 +1052,23 @@ fn path_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn sync_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) => sync_directory(parent),
+        None => Ok(()),
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // Windows does not expose directory fsync through std::fs::File. Renames remain atomic there;
+    // iOS and macOS builds use the Unix implementation above for durable transaction ordering.
+    Ok(())
 }
 
 fn sync_tree_directories(path: &Path) -> io::Result<()> {
@@ -855,9 +1078,7 @@ fn sync_tree_directories(path: &Path) -> io::Result<()> {
             sync_tree_directories(&entry.path())?;
         }
     }
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
+    sync_directory(path)?;
     Ok(())
 }
 
@@ -1166,6 +1387,21 @@ mod tests {
     }
 
     #[test]
+    fn recovery_leaves_orphaned_transaction_paths_without_a_journal_untouched() {
+        let root = temp_dir("recovery-orphan");
+        let paths = transaction_paths(&root.join("resources")).unwrap();
+        fs::create_dir(&paths.stage).unwrap();
+        fs::write(paths.stage.join("staged"), b"preserve unknown data").unwrap();
+
+        assert!(recover_transaction(&paths).is_err());
+        assert_eq!(
+            fs::read(paths.stage.join("staged")).unwrap(),
+            b"preserve unknown data"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn new_import_does_not_take_over_a_transaction_with_a_live_marker() {
         let root = temp_dir("live-transaction");
         let destination = root.join("resources");
@@ -1264,20 +1500,51 @@ mod tests {
         );
 
         let mut duplicate_zip = ZipWriter::new(Cursor::new(Vec::new()));
-        for _ in 0..2 {
+        for name in ["first", "other"] {
             duplicate_zip
-                .start_file("same", SimpleFileOptions::default())
+                .start_file(name, SimpleFileOptions::default())
                 .unwrap();
             duplicate_zip.write_all(b"payload").unwrap();
         }
-        let mut duplicate_archive =
-            ZipArchive::new(Cursor::new(duplicate_zip.finish().unwrap().into_inner())).unwrap();
-        assert!(
-            preflight(&mut duplicate_archive, RESOURCE_LIMITS)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate paths")
+        let mut duplicate_bytes = duplicate_zip.finish().unwrap().into_inner();
+        let central_headers: Vec<_> = duplicate_bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == b"PK\x01\x02").then_some(index))
+            .collect();
+        assert_eq!(central_headers.len(), 2);
+        duplicate_bytes[central_headers[1] + 46..central_headers[1] + 51].copy_from_slice(b"first");
+        let error =
+            validate_central_directory(&mut Cursor::new(duplicate_bytes.clone()), RESOURCE_LIMITS)
+                .unwrap_err();
+        assert!(error.to_string().contains("duplicate paths"));
+        let root = temp_dir("duplicate-central");
+        let active = root.join("resources");
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("preserve.txt"), b"keep the prior resources").unwrap();
+        let error = import_resources(Cursor::new(duplicate_bytes), &active).unwrap_err();
+        assert!(error.to_string().contains("duplicate paths"));
+        assert_eq!(
+            fs::read(active.join("preserve.txt")).unwrap(),
+            b"keep the prior resources"
         );
+        fs::remove_dir_all(root).unwrap();
+
+        let mut zip64_zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip64_zip
+            .start_file("file", SimpleFileOptions::default())
+            .unwrap();
+        zip64_zip.write_all(b"payload").unwrap();
+        let mut zip64_bytes = zip64_zip.finish().unwrap().into_inner();
+        let eocd = zip64_bytes
+            .windows(4)
+            .rposition(|bytes| bytes == b"PK\x05\x06")
+            .unwrap();
+        zip64_bytes[eocd + 8..eocd + 10].copy_from_slice(&u16::MAX.to_le_bytes());
+        zip64_bytes[eocd + 10..eocd + 12].copy_from_slice(&u16::MAX.to_le_bytes());
+        let error =
+            validate_central_directory(&mut Cursor::new(zip64_bytes), RESOURCE_LIMITS).unwrap_err();
+        assert!(error.to_string().contains("Zip64"));
 
         let mut case_zip = ZipWriter::new(Cursor::new(Vec::new()));
         for name in ["Assets/file", "assets/other"] {
@@ -1313,6 +1580,23 @@ mod tests {
                 .to_string()
                 .contains("compression ratio")
         );
+    }
+
+    #[test]
+    fn zip_preflight_bounds_path_prefix_work_before_allocating_prefix_tables() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let shared_deep_prefix = "a/".repeat(2044);
+        for index in 0..5 {
+            zip.start_file(
+                format!("{shared_deep_prefix}f{index}"),
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let error = preflight(&mut archive, RESOURCE_LIMITS).unwrap_err();
+        assert!(error.to_string().contains("path-prefix metadata"));
     }
 
     #[test]

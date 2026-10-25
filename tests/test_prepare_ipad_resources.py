@@ -46,6 +46,28 @@ def prepared_tree(root: Path) -> Path:
 
 
 class PrepareIpadResourcesTests(unittest.TestCase):
+    def test_sound_preparation_keeps_subcommand_before_root_options(self):
+        with temporary_root() as tmp:
+            root = Path(tmp)
+            command = prepare._horizon_prepare_command(
+                root, "sounds", "--minecraft-dir", str(root / "minecraft")
+            )
+            if command[0] == "cargo":
+                separator = command.index("--")
+                self.assertEqual(command[separator + 1], "sounds")
+            else:
+                self.assertEqual(command[1], "sounds")
+            self.assertEqual(command[-2:], ["--root", str(root)])
+
+            executable = root / ("horizon-prepare.exe" if prepare.os.name == "nt" else "horizon-prepare")
+            executable.touch()
+            prebuilt_command = prepare._horizon_prepare_command(
+                root, "sounds", "--minecraft-dir", str(root / "minecraft")
+            )
+            self.assertEqual(prebuilt_command[0], str(executable))
+            self.assertEqual(prebuilt_command[1], "sounds")
+            self.assertEqual(prebuilt_command[-2:], ["--root", str(root)])
+
     def test_package_has_hashes_for_every_resource_and_is_self_validating(self):
         with temporary_root() as tmp:
             root = Path(tmp)
@@ -82,6 +104,24 @@ class PrepareIpadResourcesTests(unittest.TestCase):
             resources = prepared_tree(Path(tmp))
             with self.assertRaisesRegex(ValueError, "outside the prepared resources folder"):
                 prepare.package_resources(resources, resources / "transfer.zip")
+
+    def test_output_symlink_does_not_redirect_replacement_to_its_target(self):
+        if prepare.os.name == "nt":
+            self.skipTest("creating filesystem symlinks may require Windows developer mode")
+        with temporary_root() as tmp:
+            root = Path(tmp)
+            resources = prepared_tree(root)
+            target = root / "keep.bin"
+            target.write_bytes(b"preserve the symlink target")
+            output = root / "resources.zip"
+            try:
+                output.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"filesystem symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "must not be a symbolic link"):
+                prepare.package_resources(resources, output)
+            self.assertEqual(target.read_bytes(), b"preserve the symlink target")
 
     def test_generated_manifest_hashes_must_match_required_resource_files(self):
         with temporary_root() as tmp:
@@ -172,6 +212,12 @@ class PrepareIpadResourcesTests(unittest.TestCase):
             with zipfile.ZipFile(bomb) as archive:
                 with self.assertRaisesRegex(ValueError, "compression ratio"):
                     prepare._validate_member_set(archive.infolist())
+
+    def test_preflight_bounds_path_prefix_work(self):
+        deep_prefix = "a/" * 2044
+        infos = [zipfile.ZipInfo(f"{deep_prefix}f{index}") for index in range(5)]
+        with self.assertRaisesRegex(ValueError, "path-prefix metadata"):
+            prepare._validate_member_set(infos)
 
     def test_upstream_version_json_and_server_jar_must_match_pins(self):
         with temporary_root() as tmp:
