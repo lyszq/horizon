@@ -12,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,13 @@ def app_info(platform: str, version: str, build_number: str, sdk_version: str) -
         "DTPlatformVersion": sdk_version,
         "DTSDKName": f"{'iphoneos' if platform == 'device' else 'iphonesimulator'}{sdk_version}",
         "LSRequiresIPhoneOS": True,
+        "UILaunchScreen": {},
+        "UIFileSharingEnabled": True,
+        "LSSupportsOpeningDocumentsInPlace": True,
+        "NSLocalNetworkUsageDescription": "Connect to Minecraft and Horizon servers on your local network.",
+        "NSBonjourServices": ["_minecraft._tcp"],
+        "GCSupportsControllerUserInteraction": True,
+        "GCSupportedGameControllers": [{"ProfileName": "ExtendedGamepad"}],
         "MinimumOSVersion": MINIMUM_IOS,
         "UIRequiredDeviceCapabilities": ["arm64", "metal"],
         "UIDeviceFamily": [1, 2],
@@ -150,6 +158,9 @@ def write_checksum(path: Path) -> None:
 def validate_app_contents(app: Path, *, allow_signature: bool) -> None:
     expected = {APP_NAME, "Info.plist", "HorizonBuildInfo.json", *ICON_SPECS}
     actual = {path.name for path in app.iterdir()}
+    missing = expected - actual
+    if missing:
+        raise ValueError(f"incomplete app bundle; missing: {sorted(missing)}")
     allowed = expected | ({"_CodeSignature"} if allow_signature else set())
     if actual - allowed:
         raise ValueError(f"unexpected app bundle contents: {sorted(actual - allowed)}")
@@ -236,15 +247,15 @@ def package(args: argparse.Namespace) -> Path:
 
     artifact = output_dir / (f"{APP_NAME}.ipa" if args.target == "device" else f"{APP_NAME}-simulator.app.zip")
     if args.target == "device":
-        payload = output_dir / "Payload"
-        if payload.exists():
-            shutil.rmtree(payload)
-        payload.mkdir()
-        shutil.copytree(app, payload / app.name)
-        if any(p.name in {"_CodeSignature", "embedded.mobileprovision"} for p in (payload / app.name).rglob("*")):
-            raise ValueError("device IPA must not contain signing state or a provisioning profile")
-        zip_tree(payload, artifact, "Payload")
-        shutil.rmtree(payload)
+        # Stage Payload in a private temporary directory. The output folder may
+        # already contain unrelated user data named "Payload".
+        with tempfile.TemporaryDirectory(prefix=".horizon-ios-payload-", dir=output_dir) as staging:
+            payload = Path(staging) / "Payload"
+            payload.mkdir()
+            shutil.copytree(app, payload / app.name)
+            if any(p.name in {"_CodeSignature", "embedded.mobileprovision"} for p in (payload / app.name).rglob("*")):
+                raise ValueError("device IPA must not contain signing state or a provisioning profile")
+            zip_tree(payload, artifact, "Payload")
     else:
         zip_tree(app, artifact, app.name)
     write_checksum(artifact)

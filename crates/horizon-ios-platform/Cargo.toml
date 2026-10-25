@@ -9,6 +9,7 @@ description = "Narrow UIKit and GameController bindings for Horizon on iPadOS"
 [target.'cfg(target_os = "ios")'.dependencies]
 raw-window-handle = "0.6"
 block2 = "0.6"
+objc2 = "0.6.5"
 
 [lints]
 workspace = true

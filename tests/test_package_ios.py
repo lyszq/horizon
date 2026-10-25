@@ -74,6 +74,10 @@ class PackageIosTests(unittest.TestCase):
 
     def test_device_ipa_is_unsigned_metadata_bound_and_contains_no_game_data(self) -> None:
         args = self.args("device")
+        existing_payload = args.output_dir / "Payload"
+        existing_payload.mkdir(parents=True)
+        sentinel = existing_payload / "keep-me.txt"
+        sentinel.write_text("existing output data", encoding="utf-8")
         with patch.object(package_ios.subprocess, "run", side_effect=self.fake_tools):
             artifact = package_ios.package(args)
 
@@ -89,11 +93,25 @@ class PackageIosTests(unittest.TestCase):
             self.assertEqual(info["CFBundleIdentifier"], "dev.lyszq.horizon")
             self.assertEqual(info["MinimumOSVersion"], "26.0")
             self.assertEqual(info["UIDeviceFamily"], [1, 2])
+            self.assertEqual(info["UILaunchScreen"], {})
+            self.assertTrue(info["UIFileSharingEnabled"])
+            self.assertTrue(info["LSSupportsOpeningDocumentsInPlace"])
+            self.assertIn("NSLocalNetworkUsageDescription", info)
+            self.assertEqual(info["NSBonjourServices"], ["_minecraft._tcp"])
+            self.assertTrue(info["GCSupportsControllerUserInteraction"])
             metadata = json.loads(archive.read("Payload/Horizon.app/HorizonBuildInfo.json"))
             self.assertEqual(metadata["commit"], args.commit)
             self.assertEqual(metadata["target"], "aarch64-apple-ios")
             self.assertEqual(metadata["sha256"]["rust_macho"], package_ios.sha256(self.binary))
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "existing output data")
+        self.assertFalse(any(path.name.startswith(".horizon-ios-payload-") for path in args.output_dir.iterdir()))
         self.assertEqual((args.output_dir / "Horizon.ipa.sha256").read_text().split()[0], package_ios.sha256(artifact))
+
+    def test_rejects_incomplete_app_bundle(self) -> None:
+        app = self.root / "incomplete.app"
+        app.mkdir()
+        with self.assertRaisesRegex(ValueError, "incomplete app bundle; missing"):
+            package_ios.validate_app_contents(app, allow_signature=False)
 
     def test_simulator_package_is_adhoc_signed_and_targets_apple_silicon_simulator(self) -> None:
         args = self.args("simulator", adhoc_sign=True)

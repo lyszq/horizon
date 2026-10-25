@@ -1,6 +1,7 @@
 //! Minimal Objective-C ABI bindings. All UI calls run on the main thread and
 //! accept a live winit window handle instead of arbitrary object pointers.
 #![allow(unsafe_op_in_unsafe_fn)]
+use objc2::runtime::Bool;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::RefCell,
@@ -136,6 +137,7 @@ pub enum Event {
     Cancelled,
     ImportResources,
     ImportWorld,
+    EditTouch,
     Play,
     Benchmark,
     ShowSetup,
@@ -203,13 +205,16 @@ unsafe extern "C" fn import_resources(_: Id, _: Sel, _: Id) {
 unsafe extern "C" fn import_world(_: Id, _: Sel, _: Id) {
     push(Event::ImportWorld);
 }
+unsafe extern "C" fn edit_touch(_: Id, _: Sel, _: Id) {
+    push(Event::EditTouch);
+}
 unsafe extern "C" fn play(_: Id, _: Sel, _: Id) {
     push(Event::Play);
 }
 unsafe extern "C" fn benchmark(_: Id, _: Sel, _: Id) {
     push(Event::Benchmark);
 }
-unsafe extern "C" fn show_setup(_: Id, _: Sel, _: Id) {
+unsafe extern "C" fn show_setup_action(_: Id, _: Sel, _: Id) {
     push(Event::ShowSetup);
 }
 unsafe extern "C" fn share(_: Id, _: Sel, _: Id) {
@@ -230,10 +235,10 @@ unsafe extern "C" fn changed(_: Id, _: Sel, field: Id) {
     }
     msg!(field, "setText:", (string(" ") => Id) -> ());
 }
-unsafe extern "C" fn enter(_: Id, _: Sel, field: Id) -> bool {
+unsafe extern "C" fn enter(_: Id, _: Sel, field: Id) -> Bool {
     push(Event::Enter);
     msg!(field, "resignFirstResponder", () -> bool);
-    true
+    Bool::YES
 }
 unsafe fn delegate() -> Id {
     static DELEGATE: OnceLock<usize> = OnceLock::new();
@@ -274,6 +279,12 @@ unsafe fn delegate() -> Id {
             "v@:@",
             unsafe extern "C" fn(Id, Sel, Id)
         );
+        method!(
+            "editTouch:",
+            edit_touch,
+            "v@:@",
+            unsafe extern "C" fn(Id, Sel, Id)
+        );
         method!("play:", play, "v@:@", unsafe extern "C" fn(Id, Sel, Id));
         method!(
             "benchmark:",
@@ -283,7 +294,7 @@ unsafe fn delegate() -> Id {
         );
         method!(
             "showSetup:",
-            show_setup,
+            show_setup_action,
             "v@:@",
             unsafe extern "C" fn(Id, Sel, Id)
         );
@@ -298,7 +309,7 @@ unsafe fn delegate() -> Id {
             "textFieldShouldReturn:",
             enter,
             "B@:@",
-            unsafe extern "C" fn(Id, Sel, Id) -> bool
+            unsafe extern "C" fn(Id, Sel, Id) -> Bool
         );
         objc_registerClassPair(cls);
         msg!(msg!(cls, "alloc", () -> Id), "init", () -> Id) as usize
@@ -364,10 +375,14 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
         msg!(label, "setTextColor:", (msg!(class(c"UIColor"), "whiteColor", () -> Id) => Id) -> ());
         msg!(label, "setNumberOfLines:", (0isize => isize) -> ());
         msg!(label, "setTextAlignment:", (1isize => isize) -> ());
+        // Keep the centered content inside the panel when Split View or rotation
+        // changes the UIKit view's width.
+        msg!(label, "setAutoresizingMask:", (7usize => usize) -> ());
         msg!(panel, "addSubview:", (label => Id) -> ());
         msg!(label, "release", () -> ());
         for (index, (title, action, enabled)) in [
             ("Import resources", "importResources:", true),
+            ("Touch controls", "editTouch:", ready),
             ("Play", "play:", ready),
             ("Import world", "importWorld:", ready),
             ("Run benchmark", "benchmark:", ready),
@@ -378,6 +393,7 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
         {
             let button = msg!(class(c"UIButton"), "buttonWithType:", (1isize => isize) -> Id);
             msg!(button, "setFrame:", (Rect { origin: Point { x, y: 218.0 + index as f64 * 58.0 }, size: Size { width, height: 48.0 } } => Rect) -> ());
+            msg!(button, "setAutoresizingMask:", (7usize => usize) -> ());
             msg!(button, "setTitle:forState:", (string(title) => Id, 0usize => usize) -> ());
             msg!(button, "setEnabled:", (*enabled => bool) -> ());
             let selector = CString::new(*action).expect("static selector");
@@ -406,6 +422,8 @@ pub fn setup_accessory(window: &impl HasWindowHandle) -> Result<(), String> {
             origin: Point { x: insets.left + 14.0, y: insets.top + 14.0 },
             size: Size { width: 82.0, height: 42.0 },
         } => Rect) -> ());
+        // Keep the shortcut anchored at the upper-left when the game view rotates.
+        msg!(button, "setAutoresizingMask:", (36usize => usize) -> ());
         msg!(button, "setTitle:forState:", (string("Files") => Id, 0usize => usize) -> ());
         msg!(button, "setTitleColor:forState:", (msg!(class(c"UIColor"), "whiteColor", () -> Id) => Id, 0usize => usize) -> ());
         msg!(button, "setBackgroundColor:", (msg!(class(c"UIColor"), "colorWithWhite:alpha:", (0.08f64 => f64, 0.84f64 => f64) -> Id) => Id) -> ());
@@ -413,6 +431,16 @@ pub fn setup_accessory(window: &impl HasWindowHandle) -> Result<(), String> {
         msg!(view, "addSubview:", (button => Id) -> ());
     }
     Ok(())
+}
+
+/// Remove the native Files shortcut while a touch-layout editor owns the screen.
+pub fn hide_accessory(window: &impl HasWindowHandle) {
+    if let Ok((view, _)) = handles(window) {
+        unsafe {
+            let accessory = msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id);
+            msg!(accessory, "removeFromSuperview", () -> ());
+        }
+    }
 }
 
 pub fn keyboard(window: &impl HasWindowHandle, visible: bool) {
@@ -562,7 +590,7 @@ pub fn controller() -> ControllerState {
 }
 
 type MouseMovedHandler = dyn Fn(Id, f32, f32);
-type ButtonChangedHandler = dyn Fn(Id, f32, bool);
+type ButtonChangedHandler = dyn Fn(Id, f32, Bool);
 type ScrollChangedHandler = dyn Fn(Id, f32, f32);
 
 struct MouseBinding {
@@ -638,10 +666,10 @@ unsafe fn bind_mouse(mouse: Id) -> Option<MouseBinding> {
         }
         let kind = kinds[index];
         let handler: block2::RcBlock<ButtonChangedHandler> =
-            block2::RcBlock::new(move |_button: Id, _value: f32, pressed: bool| {
+            block2::RcBlock::new(move |_button: Id, _value: f32, pressed: Bool| {
                 push(Event::MouseButton {
                     button: kind,
-                    pressed,
+                    pressed: pressed.as_bool(),
                 });
             });
         msg!(button, "setPressedChangedHandler:", (block2::RcBlock::as_ptr(&handler) => *mut block2::Block<ButtonChangedHandler>) -> ());
@@ -686,11 +714,17 @@ unsafe fn sync_mouse() {
             unsafe {
                 clear_mouse(previous);
             }
-        }
-        if !current.is_null() {
-            if let Some(binding) = unsafe { bind_mouse(current) } {
-                *slot.borrow_mut() = Some(binding);
+            for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+                push(Event::MouseButton {
+                    button,
+                    pressed: false,
+                });
             }
+        }
+        if !current.is_null()
+            && let Some(binding) = unsafe { bind_mouse(current) }
+        {
+            *slot.borrow_mut() = Some(binding);
         }
     });
 }
