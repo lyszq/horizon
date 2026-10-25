@@ -362,9 +362,13 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
         let accessory = msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id);
         msg!(accessory, "removeFromSuperview", () -> ());
         let bounds = msg!(view, "bounds", () -> Rect);
-        let panel = msg!(msg!(class(c"UIView"), "alloc", () -> Id), "initWithFrame:", (bounds => Rect) -> Id);
+        // Stage Manager can make the window shorter than the setup controls.
+        // Keep all actions reachable instead of placing them outside hit-testing.
+        let panel = msg!(msg!(class(c"UIScrollView"), "alloc", () -> Id), "initWithFrame:", (bounds => Rect) -> Id);
         msg!(panel, "setTag:", (SETUP_TAG => isize) -> ());
         msg!(panel, "setAutoresizingMask:", (18usize => usize) -> ());
+        msg!(panel, "setContentSize:", (Size { width: bounds.size.width, height: bounds.size.height.max(620.0) } => Size) -> ());
+        msg!(panel, "setAlwaysBounceVertical:", (true => bool) -> ());
         let background = msg!(class(c"UIColor"), "colorWithRed:green:blue:alpha:", (0.075f64 => f64, 0.09f64 => f64, 0.11f64 => f64, 1.0f64 => f64) -> Id);
         msg!(panel, "setBackgroundColor:", (background => Id) -> ());
         let width = bounds.size.width.min(660.0) - 48.0;
@@ -420,7 +424,7 @@ pub fn setup_accessory(window: &impl HasWindowHandle) -> Result<(), String> {
         msg!(button, "setTag:", (SETUP_ACCESSORY_TAG => isize) -> ());
         msg!(button, "setFrame:", (Rect {
             origin: Point { x: insets.left + 14.0, y: insets.top + 14.0 },
-            size: Size { width: 82.0, height: 42.0 },
+            size: Size { width: 82.0, height: 44.0 },
         } => Rect) -> ());
         // Keep the shortcut anchored at the upper-left when the game view rotates.
         msg!(button, "setAutoresizingMask:", (36usize => usize) -> ());
@@ -649,7 +653,9 @@ unsafe fn bind_mouse(mouse: Id) -> Option<MouseBinding> {
 
     let moved: block2::RcBlock<MouseMovedHandler> =
         block2::RcBlock::new(|_input: Id, delta_x: f32, delta_y: f32| {
-            push(Event::MouseMotion(f64::from(delta_x), f64::from(delta_y)));
+            // GameController's raw Y is upward-positive; MouseHandler follows
+            // winit's downward-positive window coordinates (as touch does).
+            push(Event::MouseMotion(f64::from(delta_x), -f64::from(delta_y)));
         });
     msg!(input, "setMouseMovedHandler:", (block2::RcBlock::as_ptr(&moved) => *mut block2::Block<MouseMovedHandler>) -> ());
 

@@ -239,12 +239,14 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+#[cfg(not(target_os = "ios"))]
+use winit::window::CursorGrabMode;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window, WindowId},
+    window::{Window, WindowId},
 };
 
 #[derive(Clone)]
@@ -4614,8 +4616,12 @@ impl Game<'_> {
             if !capture {
                 self.stop_mining();
             }
-            return;
         }
+        #[cfg(not(target_os = "ios"))]
+        self.capture_desktop(capture);
+    }
+    #[cfg(not(target_os = "ios"))]
+    fn capture_desktop(&mut self, capture: bool) {
         // MouseHandler.grabMouse never captures an inactive window.
         if capture && !self.focused {
             return;
@@ -11218,12 +11224,16 @@ impl ApplicationHandler for Game<'_> {
                             self.extras_mouse(button, pressed);
                             match self.settings.keys.translate_mouse(button) {
                                 Some(Err(b)) => self.play_mouse(b, pressed)?,
-                                Some(Ok(k)) if pressed => {
-                                    self.keys.insert(k);
-                                    self.key_pressed(k)?;
-                                }
                                 Some(Ok(k)) => {
-                                    self.keys.remove(&k);
+                                    #[cfg(target_os = "ios")]
+                                    self.mapped_key(k, pressed, false)?;
+                                    #[cfg(not(target_os = "ios"))]
+                                    if pressed {
+                                        self.keys.insert(k);
+                                        self.key_pressed(k)?;
+                                    } else {
+                                        self.keys.remove(&k);
+                                    }
                                 }
                                 None => {}
                             }
@@ -11510,7 +11520,7 @@ impl ApplicationHandler for Game<'_> {
                             let tick = Instant::now();
                             horizon_client::spans::time("tick", || self.tick())?;
                             #[cfg(target_os = "ios")]
-                            self.touch_player_tick()?;
+                            self.touch_player_tick(event_loop)?;
                             // In single player the tick is the integrated server's.
                             if self.remote.is_none() {
                                 self.perf.tick(tick.elapsed().as_secs_f32() * 1000.0);

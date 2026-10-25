@@ -469,8 +469,8 @@ impl TouchControls {
         let latches = std::mem::take(&mut self.action_latches);
         let mut effects = Vec::new();
         for action in latches {
-            self.actions_sampled_by_player.remove(&action);
             if !self.action_active(action) {
+                self.actions_sampled_by_player.remove(&action);
                 effects.push(TouchEffect::ActionChanged {
                     action,
                     pressed: false,
@@ -1608,6 +1608,50 @@ mod tests {
         touch.handle(release);
         assert!(touch.action_active(TouchAction::Jump));
         assert!(has_action(&touch.cancel_all(), TouchAction::Jump, false));
+        assert!(!touch.action_active(TouchAction::Jump));
+        assert!(touch.player_tick_complete().is_empty());
+    }
+
+    #[test]
+    fn pending_jump_tap_does_not_extend_a_new_hold_past_its_sampled_tick() {
+        let mut touch = TouchControls::default();
+        let viewport = [1024.0, 768.0];
+        let point = [0.88, 0.855];
+
+        touch.handle(event(
+            1,
+            TouchPhase::Started,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        touch.handle(event(
+            1,
+            TouchPhase::Ended,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.action_active(TouchAction::Jump));
+
+        touch.handle(event(
+            2,
+            TouchPhase::Started,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.player_tick_complete().is_empty());
+        assert!(touch.action_active(TouchAction::Jump));
+
+        let release = touch.handle(event(
+            2,
+            TouchPhase::Ended,
+            point,
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(has_action(&release, TouchAction::Jump, false));
         assert!(!touch.action_active(TouchAction::Jump));
         assert!(touch.player_tick_complete().is_empty());
     }

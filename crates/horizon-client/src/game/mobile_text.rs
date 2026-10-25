@@ -4,7 +4,7 @@ use super::{Game, Loading, Screen, startup_menu::MobileTouchAction};
 use horizon_client::Result;
 use winit::{
     dpi::PhysicalPosition,
-    event::{DeviceId, ElementState, MouseButton, Touch, WindowEvent},
+    event::{DeviceId, MouseButton, Touch, WindowEvent},
     keyboard::KeyCode,
 };
 

@@ -20,6 +20,81 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
 
 jobs:
+  verify:
+    # The upstream checks workflow intentionally skips forks; keep this PR's
+    # Linux regression evidence independent from the Apple build below.
+    if: github.repository != 'ludovic111/horizon'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      HORIZON_TELEMETRY_URL: "off"
+      HORIZON_LAUNCHER_NO_SELF_UPDATE: "1"
+      HORIZON_NO_AUDIO: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux audio and device headers
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+
+      - name: Install Rust 1.99.1 with lint components
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy,rustfmt
+
+      # Cache Cargo registry/git data and target/ only; runtime data stays in fresh runner-temp homes.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-verify-v1
+          cache-on-failure: true
+          workspaces: ". -> target"
+
+      - name: Create isolated runtime homes
+        run: |
+          root="$RUNNER_TEMP/horizon-runtime"
+          mkdir -p "$root"
+          {
+            printf 'HORIZON_HOME=%s\n' "$(mktemp -d "$root/game.XXXXXXXX")"
+            printf 'HORIZON_LAUNCHER_HOME=%s\n' "$(mktemp -d "$root/launcher.XXXXXXXX")"
+            printf 'XDG_DATA_HOME=%s\n' "$(mktemp -d "$root/xdg-data.XXXXXXXX")"
+            printf 'XDG_CONFIG_HOME=%s\n' "$(mktemp -d "$root/xdg-config.XXXXXXXX")"
+          } >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy -p horizon-client --lib --bin horizon-client --locked -- -D warnings
+
+      - name: Run asset-free Rust tests
+        run: cargo test -p horizon-client --lib --bin horizon-client --locked
+
+      - name: Test iOS package builder
+        run: python3 -m unittest discover -s tests -p 'test_package_ios.py' -v
+
+      - name: Test iPad resource preparation
+        run: python3 -m unittest discover -s tests -p 'test_prepare_ipad_resources.py' -v
+
+      - name: Test public-tree guard
+        run: python3 -m unittest discover -s tests -p 'test_public_tree.py' -v
+
+      - name: Check all tracked history for private game data
+        run: python3 tools/check_public_tree.py --history
+
+      - name: Test iOS integration artifact contract
+        run: python3 -m unittest discover -s tests -p 'test_ios_integration_contract.py' -v
+
   package-and-smoke:
     # Public GitHub-hosted Apple Silicon runner only; no project runner labels or signing secrets.
     runs-on: macos-26

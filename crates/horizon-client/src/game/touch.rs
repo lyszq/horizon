@@ -75,6 +75,7 @@ impl Game<'_> {
                     std::fs::write(path, json)?;
                 }
             }
+            self.mobile_reset_pad();
             self.touch_editor = None;
         }
         Ok(())

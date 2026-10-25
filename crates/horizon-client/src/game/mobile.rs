@@ -503,7 +503,7 @@ impl BootstrapGpu {
             });
         }
         self.queue.submit([encoder.finish()]);
-        output.present();
+        self.queue.present(output);
         Ok(true)
     }
 }
@@ -650,6 +650,7 @@ impl Game<'_> {
             return;
         }
         self.mobile.suspended = false;
+        self.mobile_reset_pad();
         self.focused = true;
         self.previous = Instant::now();
         self.mobile.last_frame = None;
@@ -707,7 +708,9 @@ impl Game<'_> {
         }
         if let Some(window) = &self.window {
             if self.touch_editor.is_none() && !self.mobile_owns_input() {
-                platform::setup_accessory(window.as_ref());
+                if let Err(error) = platform::setup_accessory(window.as_ref()) {
+                    log::warn!("iPad Files control: {error}");
+                }
             } else {
                 platform::hide_accessory(window.as_ref());
             }
@@ -886,6 +889,7 @@ impl Game<'_> {
                             );
                         }
                     } else if self.mobile.import.is_none() && self.mobile.export.is_none() {
+                        self.mobile_reset_pad();
                         self.mobile.setup_visible = false;
                         if let Some(window) = &self.window {
                             platform::hide_setup(window.as_ref());

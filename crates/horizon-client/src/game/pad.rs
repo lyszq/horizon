@@ -44,6 +44,8 @@ pub(super) struct Pads {
     /// shorter than that (a quick stick click for sprint) would be lost.
     pressed_at: [Option<u64>; 16],
     late_releases: Vec<Button>,
+    #[cfg(target_os = "ios")]
+    mobile_quarantined: u32,
     /// The merged state of the last poll.
     pub(super) state: PadState,
     /// The pad drove the game last (the mouse and keyboard hand control back).
@@ -96,6 +98,16 @@ impl Pads {
 impl Game<'_> {
     #[cfg(target_os = "ios")]
     pub(super) fn mobile_reset_pad(&mut self) {
+        let current = self.pad.read().merge(&self.pad.injected);
+        self.pad.mobile_quarantined = current.buttons;
+        for (index, button) in [Button::LeftTrigger, Button::RightTrigger]
+            .into_iter()
+            .enumerate()
+        {
+            if current.triggers[index] > 0.05 {
+                self.pad.mobile_quarantined |= 1u32 << button as u32;
+            }
+        }
         self.pad.state = PadState::default();
         self.pad.edges = Edges::default();
         self.pad.pressed_at = [None; 16];
@@ -109,7 +121,7 @@ impl Game<'_> {
         input: std::result::Result<KeyCode, MouseButton>,
     ) -> bool {
         Button::ALL.into_iter().any(|button| {
-            (self.pad.state.held(button) || self.pad.late_releases.contains(&button))
+            (self.pad.edges.is_held(button) || self.pad.late_releases.contains(&button))
                 && self
                     .settings
                     .controller
@@ -141,6 +153,32 @@ impl Game<'_> {
         let hardware = self.pad.read();
         self.ui.options.pad_style = self.settings.controller.glyphs.resolve(self.pad.style);
         let state = hardware.merge(&self.pad.injected);
+        #[cfg(target_os = "ios")]
+        let state = {
+            let mut state = state;
+            let mut down = state.buttons;
+            for (index, button) in [Button::LeftTrigger, Button::RightTrigger]
+                .into_iter()
+                .enumerate()
+            {
+                if state.triggers[index] > 0.05 {
+                    down |= 1u32 << button as u32;
+                }
+            }
+            // Buttons held over a modal or suspension must return to neutral
+            // before becoming new presses in the title/menu below it.
+            self.pad.mobile_quarantined &= down;
+            state.buttons &= !self.pad.mobile_quarantined;
+            for (index, button) in [Button::LeftTrigger, Button::RightTrigger]
+                .into_iter()
+                .enumerate()
+            {
+                if self.pad.mobile_quarantined & (1u32 << button as u32) != 0 {
+                    state.triggers[index] = 0.0;
+                }
+            }
+            state
+        };
         self.pad.virtual_input = self.pad.injected != PadState::default();
         for button in std::mem::take(&mut self.pad.taps) {
             self.pad.injected.set(button, false);
