@@ -44,15 +44,20 @@ impl Game<'_> {
         y: f64,
     ) -> horizon_client::Result<()> {
         use horizon_client::touch::{EditorCommand, TouchPhase};
-        let Some(window) = &self.window else {
+        if self.window.is_none() {
             return Ok(());
-        };
-        let size = window.inner_size();
-        let point = [
-            x as f32 / size.width.max(1) as f32,
-            y as f32 / size.height.max(1) as f32,
-        ];
+        }
+        let viewport = self.touch_viewport().map(|size| size as f32);
+        let full_point = [x as f32 / viewport[0], y as f32 / viewport[1]];
+        let safe_area = self.touch_safe_area(viewport);
+        if phase == WinitTouchPhase::Started && !safe_area.contains_full_point(full_point) {
+            return Ok(());
+        }
+        let point = safe_area.to_safe_point(full_point);
         let phase = match phase {
+            WinitTouchPhase::Ended if !safe_area.contains_full_point(full_point) => {
+                TouchPhase::Cancelled
+            }
             WinitTouchPhase::Started => TouchPhase::Started,
             WinitTouchPhase::Moved => TouchPhase::Moved,
             WinitTouchPhase::Ended => TouchPhase::Ended,
@@ -81,6 +86,36 @@ impl Game<'_> {
         Ok(())
     }
 
+    fn touch_viewport(&self) -> [u32; 2] {
+        self.renderer.as_ref().map_or_else(
+            || {
+                self.window.as_ref().map_or([1, 1], |window| {
+                    let size = window.inner_size();
+                    [size.width.max(1), size.height.max(1)]
+                })
+            },
+            |renderer| [renderer.config.width.max(1), renderer.config.height.max(1)],
+        )
+    }
+
+    #[cfg(target_os = "ios")]
+    fn touch_safe_area(&self, viewport: [f32; 2]) -> horizon_client::touch::TouchSafeArea {
+        let Some(window) = &self.window else {
+            return horizon_client::touch::TouchSafeArea::default();
+        };
+        let scale = window.scale_factor();
+        let insets = horizon_ios_platform::safe_area(window.as_ref());
+        horizon_client::touch::TouchSafeArea::from_pixel_insets(
+            viewport,
+            [
+                (insets.left * scale) as f32,
+                (insets.top * scale) as f32,
+                (insets.right * scale) as f32,
+                (insets.bottom * scale) as f32,
+            ],
+        )
+    }
+
     /// Feed one native touch sample to the controls. The event hook passes the
     /// platform's physical position; capture and layout stay normalized.
     pub(super) fn touch_input(
@@ -106,22 +141,26 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        let size = self.renderer.as_ref().map_or_else(
-            || {
-                self.window.as_ref().map_or([1, 1], |window| {
-                    let size = window.inner_size();
-                    [size.width.max(1), size.height.max(1)]
-                })
-            },
-            |renderer| [renderer.config.width.max(1), renderer.config.height.max(1)],
-        );
+        let size = self.touch_viewport();
         let viewport = [size[0] as f32, size[1] as f32];
-        let position = [(x as f32) / viewport[0], (y as f32) / viewport[1]];
+        let full_position = [(x as f32) / viewport[0], (y as f32) / viewport[1]];
         let mode = if self.pad_in_menu() || self.player.is_none() {
             TouchMode::Menu
         } else {
             TouchMode::Gameplay
         };
+        #[cfg(target_os = "ios")]
+        let (position, viewport) = if mode == TouchMode::Gameplay {
+            let safe_area = self.touch_safe_area(viewport);
+            (
+                safe_area.to_safe_point(full_position),
+                safe_area.safe_viewport(viewport),
+            )
+        } else {
+            (full_position, viewport)
+        };
+        #[cfg(not(target_os = "ios"))]
+        let (position, viewport) = (full_position, viewport);
         let phase = match phase {
             WinitTouchPhase::Started => TouchPhase::Started,
             WinitTouchPhase::Moved => TouchPhase::Moved,
@@ -356,8 +395,15 @@ impl Game<'_> {
     /// cursor and mouse handlers, so this overlay stays out of vanilla screens.
     pub(super) fn draw_touch_overlay(&self, batch: &mut HudBatch) {
         #[cfg(target_os = "ios")]
+        let safe_area = self.touch_safe_area(self.touch_viewport().map(|size| size as f32));
+        #[cfg(target_os = "ios")]
         if let Some(editor) = &self.touch_editor {
-            horizon_client::touch::draw_layout_editor(editor, &self.gui.atlas, batch);
+            horizon_client::touch::draw_layout_editor_in_safe_area(
+                editor,
+                &self.gui.atlas,
+                batch,
+                safe_area,
+            );
             return;
         }
         if !self.touch.enabled()
@@ -367,6 +413,15 @@ impl Game<'_> {
         {
             return;
         }
+        #[cfg(target_os = "ios")]
+        horizon_client::touch::draw_overlay_in_safe_area(
+            &self.touch,
+            &self.gui.atlas,
+            batch,
+            self.cursor,
+            safe_area,
+        );
+        #[cfg(not(target_os = "ios"))]
         horizon_client::touch::draw_overlay(&self.touch, &self.gui.atlas, batch, self.cursor);
     }
 }

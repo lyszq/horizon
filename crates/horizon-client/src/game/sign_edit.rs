@@ -232,7 +232,7 @@ impl Game<'_> {
     }
     /// Done button (`this.width / 2 - 100, this.height / 4 + 144`, 200x20).
     pub(super) fn sign_edit_click(&mut self, size: [u32; 2]) {
-        let b = HudBatch::new(size);
+        let b = self.ui_batch(size);
         let (x, y) = (b.width / 2.0 - 100.0, b.height / 4.0 + 144.0);
         let (mx, my) = self.cursor;
         if mx >= x && mx < x + 200.0 && my >= y && my < y + 20.0 {

@@ -423,7 +423,7 @@ impl Loading {
     }
 
     fn update_menu_cursor(&mut self) {
-        let batch = HudBatch::new(self.menu_size());
+        let batch = self.ui_batch(self.menu_size());
         self.menu.cursor = (
             self.menu.pointer.0 as f32 / batch.scale,
             self.menu.pointer.1 as f32 / batch.scale,
@@ -523,7 +523,7 @@ impl Loading {
 
     fn menu_options_click(&mut self, drag: bool, right: bool) {
         let size = self.menu_size();
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(gui) = &self.gui else { return };
         let events = self.menu.options.click(
             &mut self.settings,
@@ -641,7 +641,7 @@ impl Loading {
                         .renderer
                         .as_ref()
                         .map_or([1280, 720], |r| [r.config.width, r.config.height]);
-                    let b = HudBatch::new(size);
+                    let b = super::menu_viewport::batch(self.window.as_deref(), size);
                     title.drag(self.menu.cursor, (b.width, b.height));
                     title.drag_field(&self.gui.as_ref().unwrap().atlas, self.menu.cursor.0);
                 }
@@ -666,7 +666,7 @@ impl Loading {
                 button: MouseButton::Left,
                 ..
             } => {
-                let batch = HudBatch::new(self.menu_size());
+                let batch = self.ui_batch(self.menu_size());
                 if let (Some(title), Some(gui)) = (&mut self.menu.title, &self.gui) {
                     if state == ElementState::Released {
                         title.release();
@@ -697,7 +697,7 @@ impl Loading {
                 } else {
                     raw
                 } * self.settings.mouse_wheel_sensitivity;
-                let batch = HudBatch::new(self.menu_size());
+                let batch = self.ui_batch(self.menu_size());
                 if self.menu.options_open {
                     self.menu.options.scroll_at(
                         &self.settings,

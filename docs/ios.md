@@ -27,6 +27,10 @@ replacing the previous installation. Interrupted replacements are recovered on t
 Gameplay offers movement, look, jump, sneak, sprint, break/use, inventory, drop, hotbar and pause. Menu swipes
 scroll and a stationary long press performs a secondary click. GameController pads and physical keyboard/mouse
 feed the same game mappings; optional controller haptics and raw HID are not implemented on iPad.
+Control positions and the layout editor use the window's current safe area. While a system keyboard is docked,
+menu layout and hit testing use the remaining visible height; the full native game drawable remains unchanged.
+A floating keyboard leaves menu layout in place and can be moved by the player. UIKit supplies this geometry
+through its [keyboard layout guide](https://developer.apple.com/documentation/uikit/uikeyboardlayoutguide).
 
 The in-game **Files** button first cancels input and saves/closes the current world. Only then can world import
 or backup export run. Backups contain world ZIPs and available diagnostic reports; they do not contain the

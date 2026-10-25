@@ -893,7 +893,7 @@ impl Game<'_> {
         let scale = self
             .renderer
             .as_ref()
-            .map(|r| horizon_client::hud::HudBatch::new([r.config.width, r.config.height]).scale)
+            .map(|r| self.ui_batch([r.config.width, r.config.height]).scale)
             .ok_or("no renderer yet")?;
         let device_id = DeviceId::dummy();
         for (i, &(x, y)) in points.iter().enumerate() {
@@ -1462,9 +1462,7 @@ impl Game<'_> {
                 let scale = self
                     .renderer
                     .as_ref()
-                    .map(|r| {
-                        horizon_client::hud::HudBatch::new([r.config.width, r.config.height]).scale
-                    })
+                    .map(|r| self.ui_batch([r.config.width, r.config.height]).scale)
                     .ok_or("no renderer yet")?;
                 let device_id = DeviceId::dummy();
                 let position = PhysicalPosition::new(f64::from(x * scale), f64::from(y * scale));

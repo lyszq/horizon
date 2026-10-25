@@ -157,7 +157,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let (_, oy) = self.inventory_origin(&HudBatch::new(size));
+        let (_, oy) = self.inventory_origin(&self.ui_batch(size));
         let cursor_y = self.cursor.1;
         let Some(l) = self.station.as_mut().map(|s| &mut s.loom) else {
             return;

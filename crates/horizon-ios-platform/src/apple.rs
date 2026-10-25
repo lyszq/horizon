@@ -474,6 +474,30 @@ pub fn keyboard(window: &impl HasWindowHandle, visible: bool) {
         }
     }
 }
+/// Physical viewport above the docked keyboard. UIKit tracks split-window and
+/// keyboard animation geometry; an undocked keyboard leaves the layout intact.
+pub fn keyboard_viewport(window: &impl HasWindowHandle, physical: [u32; 2]) -> [u32; 2] {
+    let Ok((view, _)) = handles(window) else {
+        return physical;
+    };
+    unsafe {
+        let field = msg!(view, "viewWithTag:", (KEYBOARD_TAG => isize) -> Id);
+        if field.is_null() || !msg!(field, "isFirstResponder", () -> bool) {
+            return physical;
+        }
+        let bounds = msg!(view, "bounds", () -> Rect);
+        let guide = msg!(view, "keyboardLayoutGuide", () -> Id);
+        let frame = msg!(guide, "layoutFrame", () -> Rect);
+        if bounds.size.height <= 0.0 || frame.size.height <= 0.0 {
+            return physical;
+        }
+        let fraction = ((frame.origin.y - bounds.origin.y) / bounds.size.height).clamp(0.0, 1.0);
+        [
+            physical[0],
+            ((f64::from(physical[1]) * fraction).floor() as u32).max(1),
+        ]
+    }
+}
 pub fn safe_area(window: &impl HasWindowHandle) -> Insets {
     handles(window)
         .map(|(view, _)| unsafe { msg!(view, "safeAreaInsets", () -> Insets) })

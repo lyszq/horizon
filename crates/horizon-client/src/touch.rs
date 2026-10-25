@@ -53,6 +53,102 @@ impl NormalizedRect {
     }
 }
 
+/// The physical safe region expressed as fractions of the full drawable view.
+/// Touch layouts remain normalized within this region, while drawing projects
+/// them back into the full view. A zero-inset value preserves desktop layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TouchSafeArea {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl TouchSafeArea {
+    /// Build an area from physical-pixel insets ordered left, top, right,
+    /// bottom. Invalid or impossible pairs are bounded to leave a usable area.
+    pub fn from_pixel_insets(viewport: [f32; 2], insets: [f32; 4]) -> Self {
+        let [left, right] = normalized_inset_pair(insets[0], insets[2], viewport[0]);
+        let [top, bottom] = normalized_inset_pair(insets[1], insets[3], viewport[1]);
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// Convert a point normalized to the full view into safe-area coordinates.
+    pub fn to_safe_point(self, point: [f32; 2]) -> [f32; 2] {
+        [
+            (point[0] - self.left) / self.width_fraction(),
+            (point[1] - self.top) / self.height_fraction(),
+        ]
+    }
+
+    /// Project a safe-area point back into full-view normalized coordinates.
+    pub fn to_full_point(self, point: [f32; 2]) -> [f32; 2] {
+        [
+            self.left + point[0] * self.width_fraction(),
+            self.top + point[1] * self.height_fraction(),
+        ]
+    }
+
+    /// Project a saved safe-area control rectangle into full-view coordinates.
+    pub fn project_rect(self, rect: NormalizedRect) -> NormalizedRect {
+        let origin = self.to_full_point([rect.x, rect.y]);
+        NormalizedRect::new(
+            origin[0],
+            origin[1],
+            rect.width * self.width_fraction(),
+            rect.height * self.height_fraction(),
+        )
+    }
+
+    /// The drawable physical-pixel extent available to stick and look deltas.
+    pub fn safe_viewport(self, viewport: [f32; 2]) -> [f32; 2] {
+        [
+            viewport[0] * self.width_fraction(),
+            viewport[1] * self.height_fraction(),
+        ]
+    }
+
+    /// Whether a full-view point lies in the safe region.
+    pub fn contains_full_point(self, point: [f32; 2]) -> bool {
+        point.iter().all(|value| value.is_finite())
+            && point[0] >= self.left
+            && point[0] <= 1.0 - self.right
+            && point[1] >= self.top
+            && point[1] <= 1.0 - self.bottom
+    }
+
+    fn width_fraction(self) -> f32 {
+        1.0 - self.left - self.right
+    }
+
+    fn height_fraction(self) -> f32 {
+        1.0 - self.top - self.bottom
+    }
+}
+
+fn normalized_inset_pair(first: f32, second: f32, dimension: f32) -> [f32; 2] {
+    const MAX_TOTAL: f32 = 0.95;
+    let dimension = if dimension.is_finite() && dimension > 0.0 {
+        dimension
+    } else {
+        1.0
+    };
+    let first = finite_or(first, 0.0).max(0.0) / dimension;
+    let second = finite_or(second, 0.0).max(0.0) / dimension;
+    let total = first + second;
+    if total > MAX_TOTAL {
+        let factor = MAX_TOTAL / total;
+        [first * factor, second * factor]
+    } else {
+        [first, second]
+    }
+}
+
 /// Controls that can own a finger. The look area captures a swipe but has no
 /// visible button; the action controls are drawn by the game overlay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -317,12 +413,24 @@ pub fn draw_overlay(
     batch: &mut HudBatch,
     cursor: (f32, f32),
 ) {
+    draw_overlay_in_safe_area(controls, atlas, batch, cursor, TouchSafeArea::default());
+}
+
+/// Draw the gameplay overlay with saved control positions relative to a
+/// physical safe area. The batch and framebuffer still cover the full view.
+pub fn draw_overlay_in_safe_area(
+    controls: &TouchControls,
+    atlas: &HudAtlas,
+    batch: &mut HudBatch,
+    cursor: (f32, f32),
+    safe_area: TouchSafeArea,
+) {
     if !controls.enabled() {
         return;
     }
     let mut ui = Ui::new(atlas, batch, cursor);
     for region in &controls.layout().controls {
-        let rect = region.rect;
+        let rect = safe_area.project_rect(region.rect);
         let (x, y, w, h) = (
             rect.x * ui.w,
             rect.y * ui.h,
@@ -332,10 +440,8 @@ pub fn draw_overlay(
         match region.control {
             TouchControl::MoveStick => {
                 let radius = (w.min(h) * 0.39).max(18.0);
-                let (center, knob) = controls.stick_visual().unwrap_or_else(|| {
-                    let center = [rect.x + rect.width / 2.0, rect.y + rect.height / 2.0];
-                    (center, center)
-                });
+                let (center, knob) =
+                    projected_stick_points(safe_area, region.rect, controls.stick_visual());
                 let center = (center[0] * ui.w, center[1] * ui.h);
                 let knob = (knob[0] * ui.w, knob[1] * ui.h);
                 ui.rounded(
@@ -405,6 +511,22 @@ pub fn draw_overlay(
         }
     }
     ui.finish();
+}
+
+fn projected_stick_points(
+    safe_area: TouchSafeArea,
+    saved_rect: NormalizedRect,
+    visual: Option<([f32; 2], [f32; 2])>,
+) -> ([f32; 2], [f32; 2]) {
+    let idle_center = [
+        saved_rect.x + saved_rect.width / 2.0,
+        saved_rect.y + saved_rect.height / 2.0,
+    ];
+    let (center, knob) = visual.unwrap_or((idle_center, idle_center));
+    (
+        safe_area.to_full_point(center),
+        safe_area.to_full_point(knob),
+    )
 }
 
 impl Default for TouchControls {
@@ -1041,14 +1163,25 @@ impl LayoutEditor {
 }
 
 pub fn draw_layout_editor(editor: &LayoutEditor, atlas: &HudAtlas, batch: &mut HudBatch) {
+    draw_layout_editor_in_safe_area(editor, atlas, batch, TouchSafeArea::default());
+}
+
+/// Draw the layout editor within the same physical safe area used for its hit
+/// tests, without changing the full-view framebuffer or ordinary menus.
+pub fn draw_layout_editor_in_safe_area(
+    editor: &LayoutEditor,
+    atlas: &HudAtlas,
+    batch: &mut HudBatch,
+    safe_area: TouchSafeArea,
+) {
     let mut controls = TouchControls::default();
     controls.set_layout(editor.draft.clone());
     controls.set_enabled(true);
-    draw_overlay(&controls, atlas, batch, (0.0, 0.0));
+    draw_overlay_in_safe_area(&controls, atlas, batch, (0.0, 0.0), safe_area);
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
     for region in &editor.draft.controls {
         if region.control == TouchControl::Look {
-            let rect = region.rect;
+            let rect = safe_area.project_rect(region.rect);
             let (x, y, w, h) = (
                 rect.x * ui.w,
                 rect.y * ui.h,
@@ -1066,16 +1199,30 @@ pub fn draw_layout_editor(editor: &LayoutEditor, atlas: &HudAtlas, batch: &mut H
             );
         }
     }
-    ui.rounded(0.0, 0.0, ui.w, ui.h * 0.12, 0.0, rgba(13, 14, 19, 245));
+    let toolbar_origin = safe_area.to_full_point([0.0, 0.0]);
+    let toolbar_end = safe_area.to_full_point([1.0, 0.12]);
+    let toolbar_x = toolbar_origin[0] * ui.w;
+    let toolbar_y = toolbar_origin[1] * ui.h;
+    let toolbar_width = (toolbar_end[0] - toolbar_origin[0]) * ui.w;
+    let toolbar_height = (toolbar_end[1] - toolbar_origin[1]) * ui.h;
+    ui.rounded(
+        toolbar_x,
+        toolbar_y,
+        toolbar_width,
+        toolbar_height,
+        0.0,
+        rgba(13, 14, 19, 245),
+    );
     for (index, label) in ["Save", "Reset", "Look -", "Look +", "Cancel"]
         .iter()
         .enumerate()
     {
+        let point = safe_area.to_full_point([index as f32 * 0.2 + 0.1, 0.025]);
         ui.text_centered(
             Face::Medium,
             ui_theme::BODY,
-            ui.w * (index as f32 * 0.2 + 0.1),
-            ui.h * 0.025,
+            ui.w * point[0],
+            ui.h * point[1],
             ui_theme::color::TEXT,
             label,
         );
@@ -1084,11 +1231,12 @@ pub fn draw_layout_editor(editor: &LayoutEditor, atlas: &HudAtlas, batch: &mut H
         "Drag to move; two fingers on a control to resize. Look sensitivity: {:.2}",
         editor.draft.look_sensitivity
     );
+    let message_point = safe_area.to_full_point([0.5, 0.125]);
     ui.text_centered(
         Face::Regular,
         ui_theme::BODY * 0.8,
-        ui.w * 0.5,
-        ui.h * 0.125,
+        ui.w * message_point[0],
+        ui.h * message_point[1],
         ui_theme::color::TEXT,
         &message,
     );
@@ -1315,6 +1463,93 @@ mod tests {
             ));
             assert!(has_action(&effects, TouchAction::Break, true));
         }
+    }
+
+    #[test]
+    fn safe_area_projection_round_trips_points_and_control_bounds() {
+        let area = TouchSafeArea::from_pixel_insets([2000.0, 1000.0], [80.0, 40.0, 60.0, 20.0]);
+        let local = [0.37, 0.72];
+        let full = area.to_full_point(local);
+        let restored = area.to_safe_point(full);
+        assert!((restored[0] - local[0]).abs() < 0.0001);
+        assert!((restored[1] - local[1]).abs() < 0.0001);
+        assert!(!area.contains_full_point([0.01, 0.5]));
+
+        let safe_rect = NormalizedRect::new(0.8, 0.7, 0.1, 0.12);
+        let projected = area.project_rect(safe_rect);
+        let projected_top_left = [projected.x, projected.y];
+        let projected_bottom_right = [
+            projected.x + projected.width,
+            projected.y + projected.height,
+        ];
+        assert!(area.contains_full_point(projected_top_left));
+        assert!(area.contains_full_point(projected_bottom_right));
+        let safe_viewport = area.safe_viewport([2000.0, 1000.0]);
+        assert!((safe_viewport[0] - 1860.0).abs() < 0.01);
+        assert!((safe_viewport[1] - 940.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn idle_and_held_stick_visuals_project_from_safe_area_once() {
+        let safe = TouchSafeArea::from_pixel_insets([1200.0, 800.0], [72.0, 48.0, 36.0, 24.0]);
+        let rect = TouchLayout::default()
+            .controls
+            .into_iter()
+            .find(|region| region.control == TouchControl::MoveStick)
+            .unwrap()
+            .rect;
+        let idle_center = [rect.x + rect.width / 2.0, rect.y + rect.height / 2.0];
+        assert_eq!(
+            projected_stick_points(safe, rect, None),
+            (
+                safe.to_full_point(idle_center),
+                safe.to_full_point(idle_center)
+            )
+        );
+
+        let held = ([0.21, 0.73], [0.24, 0.69]);
+        assert_eq!(
+            projected_stick_points(safe, rect, Some(held)),
+            (safe.to_full_point(held.0), safe.to_full_point(held.1))
+        );
+    }
+
+    #[test]
+    fn safe_area_projected_action_and_editor_toolbar_keep_matching_hit_tests() {
+        let physical_viewport = [1200.0, 800.0];
+        let safe = TouchSafeArea::from_pixel_insets(physical_viewport, [72.0, 48.0, 36.0, 24.0]);
+        let safe_viewport = safe.safe_viewport(physical_viewport);
+        let layout = TouchLayout::default();
+        let jump = layout
+            .controls
+            .iter()
+            .find(|region| region.control == TouchControl::Jump)
+            .unwrap()
+            .rect;
+        let full_jump_center =
+            safe.to_full_point([jump.x + jump.width / 2.0, jump.y + jump.height / 2.0]);
+        let local_jump_center = safe.to_safe_point(full_jump_center);
+        let mut controls = TouchControls::default();
+        controls.handle(event(
+            1,
+            TouchPhase::Started,
+            local_jump_center,
+            safe_viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(controls.action_active(TouchAction::Jump));
+
+        let mut editor = LayoutEditor::new(&layout);
+        let full_save_center = safe.to_full_point([0.1, 0.025]);
+        let local_save_center = safe.to_safe_point(full_save_center);
+        assert_eq!(
+            editor.handle(2, TouchPhase::Started, local_save_center),
+            None
+        );
+        assert_eq!(
+            editor.handle(2, TouchPhase::Ended, local_save_center),
+            Some(EditorCommand::Save)
+        );
     }
 
     #[test]

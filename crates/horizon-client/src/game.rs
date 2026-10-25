@@ -90,6 +90,7 @@ mod loom;
 mod mace;
 mod machines;
 mod maps;
+mod menu_viewport;
 mod minecarts;
 mod mob_blocks;
 mod mob_gear;
@@ -4671,7 +4672,7 @@ impl Game<'_> {
                 if self.focused {
                     warp(window);
                 }
-                let scale = HudBatch::new(size).scale;
+                let scale = self.ui_batch(size).scale;
                 self.cursor = (size[0] as f32 / 2.0 / scale, size[1] as f32 / 2.0 / scale);
             } else {
                 let _ = window.set_cursor_grab(CursorGrabMode::None);
@@ -4813,7 +4814,7 @@ impl Game<'_> {
         // The pack prompt replaces the connecting screen (setScreen), but
         // in game it opens over the world.
         let mut batch = if self.server_packs.prompt.is_some() && self.player.is_none() {
-            HudBatch::new(size)
+            self.ui_batch(size)
         } else {
             self.hud_layers(size)
         };
@@ -4828,8 +4829,8 @@ impl Game<'_> {
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
-        let mut batch = HudBatch::new(size);
-        let (w, h) = (batch.width, batch.height);
+        let mut batch = self.ui_batch(size);
+        let menu_height = batch.height;
         if self.screen == Screen::Win {
             self.draw_win_screen(&mut batch);
             return batch;
@@ -4862,6 +4863,10 @@ impl Game<'_> {
             self.draw_level_loading(&mut batch, reason);
             return batch;
         }
+        // Camera overlays and the reticle stay aligned with the full drawable.
+        // Focused screens below use the keyboard's remaining visible height.
+        batch.height = (size[1] as f32 / batch.scale).ceil();
+        let (w, h) = (batch.width, batch.height);
         // Hud.extractRenderState: F1 (keyToggleGui) hides camera overlays, the
         // crosshair, hotbar, effects, bars, sidebar, action bar, titles and chat;
         // the sleep overlay, debug screen and open screens still draw.
@@ -5034,6 +5039,7 @@ impl Game<'_> {
             let tw = HudBatch::text_width(atlas, text);
             batch.text(atlas, text, (w - tw) / 2.0, h - 59.0, u32::MAX, true);
         }
+        batch.height = menu_height;
         self.draw_chat(&mut batch);
         self.draw_tab_list(&mut batch);
         // Screen.extractBlurredBackground blurs the world and HUD, while the
@@ -6082,7 +6088,7 @@ impl Game<'_> {
         else {
             return false;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let hover = match self.slot_at(&batch, self.cursor.0, self.cursor.1) {
             None => Hover::Nothing,
             Some(slot) if slot >= Creative::DISPLAY => {
@@ -6108,7 +6114,7 @@ impl Game<'_> {
         else {
             return false;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1) else {
             return false;
         };
@@ -6268,7 +6274,7 @@ impl Game<'_> {
         let Some(r) = self.renderer.as_ref() else {
             return;
         };
-        let batch = HudBatch::new([r.config.width, r.config.height]);
+        let batch = self.ui_batch([r.config.width, r.config.height]);
         if let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1)
             && slot != 200
             && slot < Creative::DISPLAY
@@ -6284,7 +6290,7 @@ impl Game<'_> {
         let Some(r) = self.renderer.as_ref() else {
             return (None, false);
         };
-        let batch = HudBatch::new([r.config.width, r.config.height]);
+        let batch = self.ui_batch([r.config.width, r.config.height]);
         (
             self.slot_at(&batch, self.cursor.0, self.cursor.1),
             self.clicked_outside(&batch),
@@ -6514,7 +6520,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1) else {
             return;
         };
@@ -9650,7 +9656,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let (ox, oy) = Self::creative_origin(&batch);
         let (cx, cy) = self.cursor;
         let tabs = self.creative_screen.tabs.clone();
@@ -9969,7 +9975,7 @@ impl Game<'_> {
         // GameRenderer.render3dHud: the debug crosshair, first person with the HUD shown.
         let mut crosshair = horizon_client::gizmos::Gizmos::default();
         if self.debug_crosshair() && self.camera_type.first_person() && !self.ui.hide_gui {
-            let scale = HudBatch::new(size).scale;
+            let scale = self.ui_batch(size).scale;
             crosshair.debug_crosshair(at, view_pitch, view_yaw, scale);
         }
         let debug_lines = horizon_client::gizmos::camera_relative(&lines, at, view);
@@ -11000,7 +11006,7 @@ impl ApplicationHandler for Game<'_> {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(r) = &self.renderer {
-                        let b = HudBatch::new([r.config.width, r.config.height]);
+                        let b = self.ui_batch([r.config.width, r.config.height]);
                         self.cursor = (position.x as f32 / b.scale, position.y as f32 / b.scale);
                         if self.screen == Screen::Advancements {
                             self.advancements_drag();
@@ -11049,7 +11055,8 @@ impl ApplicationHandler for Game<'_> {
                             .as_ref()
                             .map(|w| w.inner_size())
                             .unwrap_or_default();
-                        let batch = HudBatch::new([size.width, size.height]);
+                        let batch =
+                            menu_viewport::batch(self.window.as_deref(), [size.width, size.height]);
                         title.scroll_worlds(d, self.cursor, (batch.width, batch.height));
                     }
                     if self.screen == Screen::Playing
@@ -11139,7 +11146,7 @@ impl ApplicationHandler for Game<'_> {
                         .as_ref()
                         .map(|r| [r.config.width, r.config.height])
                         .unwrap_or([1, 1]);
-                    let b = HudBatch::new(size);
+                    let b = self.ui_batch(size);
                     let atlas = &self.gui.atlas;
                     let shift = self.has_shift_down();
                     let (action, sound) = self.title.as_mut().map_or((Action::None, false), |t| {
@@ -13179,7 +13186,7 @@ impl Loading {
         else {
             return;
         };
-        let mut batch = HudBatch::new(size);
+        let mut batch = self.ui_batch(size);
         self.draw_menu(&mut batch);
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(

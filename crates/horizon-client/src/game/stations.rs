@@ -841,7 +841,7 @@ impl Game<'_> {
         else {
             return true;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let (ox, oy) = self.inventory_origin(&batch);
         let local = (self.cursor.0 - ox, self.cursor.1 - oy);
         let shift = self.has_shift_down();
