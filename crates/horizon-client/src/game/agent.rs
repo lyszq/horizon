@@ -472,6 +472,8 @@ impl Game<'_> {
                 "sprinting": self.keys.contains(&KeyCode::ControlLeft),
                 "health": p.health.health(),
                 "absorption": p.health.absorption(),
+                // The hurt animation's ticks left (the camera's hurt tilt).
+                "hurt_time": p.health.hurt_animation_time,
                 "air": p.air,
                 "food": p.health.food.food,
                 "saturation": p.health.food.saturation,
@@ -893,7 +895,7 @@ impl Game<'_> {
         let scale = self
             .renderer
             .as_ref()
-            .map(|r| horizon_client::hud::HudBatch::new([r.config.width, r.config.height]).scale)
+            .map(|r| self.ui_batch([r.config.width, r.config.height]).scale)
             .ok_or("no renderer yet")?;
         let device_id = DeviceId::dummy();
         for (i, &(x, y)) in points.iter().enumerate() {
@@ -1462,9 +1464,7 @@ impl Game<'_> {
                 let scale = self
                     .renderer
                     .as_ref()
-                    .map(|r| {
-                        horizon_client::hud::HudBatch::new([r.config.width, r.config.height]).scale
-                    })
+                    .map(|r| self.ui_batch([r.config.width, r.config.height]).scale)
                     .ok_or("no renderer yet")?;
                 let device_id = DeviceId::dummy();
                 let position = PhysicalPosition::new(f64::from(x * scale), f64::from(y * scale));

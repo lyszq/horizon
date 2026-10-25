@@ -5,7 +5,12 @@ use horizon_client::{
     clipboard::{self, AppendSelection, SystemClipboard},
     options_ui::{Event, OptionsUi, Page},
 };
-use winit::{event::KeyEvent, keyboard::ModifiersState};
+#[cfg(target_os = "ios")]
+use winit::event::TouchPhase;
+use winit::{
+    event::{ElementState, KeyEvent},
+    keyboard::{KeyCode, ModifiersState},
+};
 
 #[derive(Default)]
 pub(super) struct StartupMenu {
@@ -22,6 +27,7 @@ pub(super) struct StartupMenu {
     dragging: bool,
     clipboard: SystemClipboard,
     selection: AppendSelection,
+    touch_finger: Option<u64>,
     pub pending: Option<PendingWorldEntry>,
     pub reload_packs: bool,
     pub perf: horizon_client::telemetry::Session,
@@ -98,6 +104,127 @@ impl StartupMenu {
             game.options_from_title = true;
             game.dragging = self.dragging;
         }
+    }
+
+    /// Route committed native text to the already focused title/options field.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_text(&mut self, atlas: &horizon_client::hud::HudAtlas, text: &str) {
+        if !self.mobile_wants_keyboard() || text.is_empty() {
+            return;
+        }
+        if self.options_open {
+            self.options.type_text(atlas, text);
+            return;
+        }
+        let Some(title) = &mut self.title else { return };
+        let cleared = !title.has_caret_field()
+            && title
+                .focused_field()
+                .is_some_and(|(id, value, _)| self.selection.take(id, value));
+        if cleared {
+            title.search_changed();
+        }
+        title.type_text(text);
+    }
+
+    /// Backspace in the focused native text field, using the same selection
+    /// and cursor handling as the physical-key route.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_backspace(
+        &mut self,
+        settings: &mut Settings,
+        atlas: &horizon_client::hud::HudAtlas,
+    ) -> Vec<Event> {
+        if !self.mobile_wants_keyboard() {
+            return Vec::new();
+        }
+        if self.options_open {
+            return self.options.key(settings, atlas, KeyCode::Backspace, None);
+        }
+        let Some(title) = &mut self.title else {
+            return Vec::new();
+        };
+        let cleared = !title.has_caret_field()
+            && title
+                .focused_field()
+                .is_some_and(|(id, value, _)| self.selection.take(id, value));
+        if cleared {
+            title.search_changed();
+        } else if title.has_caret_field() || title.focused_field().is_some() {
+            title.backspace();
+        }
+        Vec::new()
+    }
+
+    /// Enter in the focused title/options view.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_enter(
+        &mut self,
+        settings: &mut Settings,
+        atlas: &horizon_client::hud::HudAtlas,
+    ) -> Vec<Event> {
+        if !self.mobile_wants_keyboard() {
+            return Vec::new();
+        }
+        if self.options_open {
+            return self.options.key(settings, atlas, KeyCode::Enter, None);
+        }
+        if let Some(title) = &mut self.title {
+            title.confirm_edit();
+        }
+        Vec::new()
+    }
+
+    /// Only show the native keyboard when a text field has actually taken
+    /// focus; title screens also contain many non-text controls.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_wants_keyboard(&mut self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        if self.options_open {
+            return self.options.mobile_text_focused();
+        }
+        self.title
+            .as_mut()
+            .is_some_and(|title| title.focused_field().is_some())
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_touch(
+        &mut self,
+        id: u64,
+        phase: TouchPhase,
+        position: [f64; 2],
+    ) -> Vec<MobileTouchAction> {
+        match phase {
+            TouchPhase::Started if self.touch_finger.is_none() => {
+                self.touch_finger = Some(id);
+                vec![
+                    MobileTouchAction::Move(position),
+                    MobileTouchAction::Button(ElementState::Pressed),
+                ]
+            }
+            TouchPhase::Moved if self.touch_finger == Some(id) => {
+                vec![MobileTouchAction::Move(position)]
+            }
+            TouchPhase::Ended if self.touch_finger == Some(id) => {
+                self.touch_finger = None;
+                vec![
+                    MobileTouchAction::Move(position),
+                    MobileTouchAction::Button(ElementState::Released),
+                ]
+            }
+            TouchPhase::Cancelled if self.touch_finger == Some(id) => {
+                self.touch_finger = None;
+                vec![MobileTouchAction::Cancelled]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(super) fn cancel_mobile_touch(&mut self) {
+        self.touch_finger = None;
     }
 
     fn queue_entry(&mut self, action: Action, player_name: String) {
@@ -201,6 +328,13 @@ impl StartupMenu {
     }
 }
 
+#[cfg(target_os = "ios")]
+pub(super) enum MobileTouchAction {
+    Move([f64; 2]),
+    Button(ElementState),
+    Cancelled,
+}
+
 /// Each generation has its own channel and progress. Pack changes wait for the
 /// old tail before starting another generation, including cache/global writes.
 pub(super) fn spawn_loader(
@@ -289,7 +423,7 @@ impl Loading {
     }
 
     fn update_menu_cursor(&mut self) {
-        let batch = HudBatch::new(self.menu_size());
+        let batch = self.ui_batch(self.menu_size());
         self.menu.cursor = (
             self.menu.pointer.0 as f32 / batch.scale,
             self.menu.pointer.1 as f32 / batch.scale,
@@ -302,7 +436,7 @@ impl Loading {
             .map_or([1280, 720], |r| [r.config.width, r.config.height])
     }
 
-    fn save_menu_address(&mut self) {
+    pub(super) fn save_menu_address(&mut self) {
         if self
             .menu
             .title
@@ -332,7 +466,7 @@ impl Loading {
         self.menu.options_open = true;
     }
 
-    fn menu_option_events(&mut self, events: Vec<Event>) {
+    pub(super) fn menu_option_events(&mut self, events: Vec<Event>) {
         for event in events {
             match event {
                 Event::Changed => {
@@ -389,7 +523,7 @@ impl Loading {
 
     fn menu_options_click(&mut self, drag: bool, right: bool) {
         let size = self.menu_size();
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(gui) = &self.gui else { return };
         let events = self.menu.options.click(
             &mut self.settings,
@@ -402,6 +536,20 @@ impl Loading {
             right,
         );
         self.menu_option_events(events);
+    }
+
+    /// Drop menu drag state after UIKit cancels a touch sequence. Do not send
+    /// a synthetic click release, which could complete a half-finished action.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_cancel_touch_drag(&mut self) {
+        self.menu.cancel_mobile_touch();
+        self.menu.dragging = false;
+        let events = self.menu.options.release();
+        self.menu_option_events(events);
+        if let Some(title) = &mut self.menu.title {
+            title.release();
+            title.release_field();
+        }
     }
 
     fn menu_action(&mut self, event_loop: &ActiveEventLoop, action: Action) {
@@ -452,6 +600,7 @@ impl Loading {
                 self.menu.modifiers = ModifiersState::empty();
                 self.menu.physical_keys.clear();
                 self.menu.dragging = false;
+                self.menu.cancel_mobile_touch();
                 if let Some(title) = &mut self.menu.title {
                     title.release();
                     title.release_field();
@@ -492,7 +641,7 @@ impl Loading {
                         .renderer
                         .as_ref()
                         .map_or([1280, 720], |r| [r.config.width, r.config.height]);
-                    let b = HudBatch::new(size);
+                    let b = super::menu_viewport::batch(self.window.as_deref(), size);
                     title.drag(self.menu.cursor, (b.width, b.height));
                     title.drag_field(&self.gui.as_ref().unwrap().atlas, self.menu.cursor.0);
                 }
@@ -517,7 +666,7 @@ impl Loading {
                 button: MouseButton::Left,
                 ..
             } => {
-                let batch = HudBatch::new(self.menu_size());
+                let batch = self.ui_batch(self.menu_size());
                 if let (Some(title), Some(gui)) = (&mut self.menu.title, &self.gui) {
                     if state == ElementState::Released {
                         title.release();
@@ -548,7 +697,7 @@ impl Loading {
                 } else {
                     raw
                 } * self.settings.mouse_wheel_sensitivity;
-                let batch = HudBatch::new(self.menu_size());
+                let batch = self.ui_batch(self.menu_size());
                 if self.menu.options_open {
                     self.menu.options.scroll_at(
                         &self.settings,

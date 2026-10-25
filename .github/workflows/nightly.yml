@@ -29,6 +29,7 @@ env:
 
 jobs:
   audit:
+    if: github.repository == 'ludovic111/horizon'
     runs-on: [self-hosted, horizon-game]
     timeout-minutes: 150
     steps:

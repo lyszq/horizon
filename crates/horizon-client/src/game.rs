@@ -13,6 +13,7 @@ mod block_entity_anims;
 mod block_entity_ticks;
 mod block_items;
 mod blockctl;
+mod boat_passengers;
 mod boats;
 mod books;
 mod bossbars;
@@ -90,9 +91,14 @@ mod loom;
 mod mace;
 mod machines;
 mod maps;
+mod menu_viewport;
 mod minecarts;
 mod mob_blocks;
 mod mob_gear;
+#[cfg(target_os = "ios")]
+mod mobile;
+#[cfg(target_os = "ios")]
+mod mobile_text;
 mod mods;
 mod mount_menu;
 mod mounts;
@@ -153,9 +159,11 @@ mod storage;
 mod structures;
 mod subtitle_hud;
 mod sulfur_cubes;
+mod text_displays;
 mod titles;
 mod tnt;
 mod totem;
+mod touch;
 mod trading;
 mod trial_spawner;
 mod trial_visuals;
@@ -234,12 +242,14 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+#[cfg(not(target_os = "ios"))]
+use winit::window::CursorGrabMode;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window, WindowId},
+    window::{Window, WindowId},
 };
 
 #[derive(Clone)]
@@ -1192,6 +1202,8 @@ struct Game<'a> {
     keys: HashSet<KeyCode>,
     // Physical input is separate from remapped and toggled movement keys.
     physical_keys: HashSet<KeyCode>,
+    #[cfg(target_os = "ios")]
+    physical_mouse: HashSet<MouseButton>,
     left: bool,
     right: bool,
     cursor: (f32, f32),
@@ -1232,6 +1244,11 @@ struct Game<'a> {
     last_input: Instant,
     /// Controllers (Horizon's own).
     pad: pad::Pads,
+    touch: horizon_client::touch::TouchControls,
+    #[cfg(target_os = "ios")]
+    touch_editor: Option<horizon_client::touch::LayoutEditor>,
+    #[cfg(target_os = "ios")]
+    mobile: mobile::MobileState,
     frames: u64,
     /// Frames drawn with the player in the world, for `--world-frames`.
     world_frames: u64,
@@ -1421,6 +1438,8 @@ struct Game<'a> {
     dragon_model: Option<horizon_client::mobs::Part>,
     /// Map textures waiting for the next HUD batch to upload them.
     map_patches: Vec<horizon_client::font::Patch>,
+    text_displays: std::collections::HashMap<i32, text_displays::RemoteTextDisplay>,
+    text_display_vertices: usize,
     /// Player skin downloads, and which skin each atlas skin slot holds
     /// (least recently shown first).
     skin_downloads: RefCell<horizon_client::skins::Downloader>,
@@ -4045,6 +4064,20 @@ impl Game<'_> {
         self.capture_loaded_world();
         Ok(())
     }
+    /// Landing rules (farmland trampling, turtle eggs) wrote or removed the block
+    /// raw: finish `Level.setBlock`'s neighbour updates, so a crop on trampled
+    /// farmland breaks. The local player's and every server player's landings.
+    fn landing_block_updates(&mut self, event: &horizon_client::landing::FallEvent) {
+        use horizon_client::landing::FallEvent;
+        let (position, flags) = match *event {
+            FallEvent::Write {
+                position, flags, ..
+            } => (position, flags as i32),
+            FallEvent::Destroy { position, .. } => (position, level_flags::UPDATE_ALL),
+            _ => return,
+        };
+        self.with_level(|b, level, ticks| b.notify_written(level, ticks, position, flags));
+    }
     fn tick(&mut self) -> Result<()> {
         self.tick_debug_keys()?;
         self.tick_debug_charts();
@@ -4084,7 +4117,13 @@ impl Game<'_> {
         self.tick_command_extras();
         self.tick_mods();
         let camera_eye = self.camera_eye_height();
-        let stick = self.pad_move();
+        let pad = self.pad_move().unwrap_or([0.0; 2]);
+        let touch = self.touch.movement_vector();
+        let combined = [
+            (pad[0] + touch[0]).clamp(-1.0, 1.0),
+            (pad[1] + touch[1]).clamp(-1.0, 1.0),
+        ];
+        let stick = (combined != [0.0; 2]).then_some(combined);
         if self.riding.is_some() && self.player.is_some() {
             let playing = self.screen == Screen::Playing;
             let held = |k| playing && self.keys.contains(&k);
@@ -4259,23 +4298,7 @@ impl Game<'_> {
                     };
                     self.audio.play(name, Some(feet), volume, pitch);
                 }
-                MotionEvent::Fall(horizon_client::landing::FallEvent::Write {
-                    position,
-                    flags,
-                    ..
-                }) => {
-                    // Landing rules (farmland trampling, turtle eggs) wrote the block raw.
-                    self.with_level(|b, level, ticks| {
-                        b.notify_written(level, ticks, position, flags as i32)
-                    });
-                }
-                MotionEvent::Fall(horizon_client::landing::FallEvent::Destroy {
-                    position, ..
-                }) => {
-                    self.with_level(|b, level, ticks| {
-                        b.notify_written(level, ticks, position, level_flags::UPDATE_ALL)
-                    });
-                }
+                MotionEvent::Fall(event) => self.landing_block_updates(&event),
                 MotionEvent::Snowflake { position, velocity } => self.snowflake(position, velocity),
                 MotionEvent::EnterBlock { state } => self.trigger_enter_block(state),
                 MotionEvent::InsidePortal { pos } => self.player_inside_nether_portal(pos),
@@ -4413,7 +4436,7 @@ impl Game<'_> {
                 self.resolve_arrivals();
             });
         }
-        horizon_client::spans::time("tick_lan", || self.tick_lan());
+        horizon_client::spans::time("tick_lan", || self.tick_lan(false));
         self.tick_friends();
         horizon_client::spans::time("tick_hand", || self.tick_hand());
         horizon_client::spans::time("tick_sleep", || self.tick_sleep());
@@ -4463,6 +4486,10 @@ impl Game<'_> {
     /// A key event after rebinding, as the default key of its mapping (the
     /// keyboard and controllers both end here).
     fn mapped_key(&mut self, key: KeyCode, pressed: bool, repeat: bool) -> Result<()> {
+        #[cfg(target_os = "ios")]
+        if !pressed && self.mobile_input_held(Ok(key)) {
+            return Ok(());
+        }
         // Sneak and sprint are ToggleKeyMappings: a press (or a key
         // repeat) flips them when toggling; only releases reach them
         // behind a screen (KeyboardHandler.keyPress).
@@ -4586,6 +4613,18 @@ impl Game<'_> {
         if self.lan_acting.is_some() {
             return;
         }
+        #[cfg(target_os = "ios")]
+        {
+            self.captured = capture && self.focused;
+            if !capture {
+                self.stop_mining();
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        self.capture_desktop(capture);
+    }
+    #[cfg(not(target_os = "ios"))]
+    fn capture_desktop(&mut self, capture: bool) {
         // MouseHandler.grabMouse never captures an inactive window.
         if capture && !self.focused {
             return;
@@ -4635,7 +4674,7 @@ impl Game<'_> {
                 if self.focused {
                     warp(window);
                 }
-                let scale = HudBatch::new(size).scale;
+                let scale = self.ui_batch(size).scale;
                 self.cursor = (size[0] as f32 / 2.0 / scale, size[1] as f32 / 2.0 / scale);
             } else {
                 let _ = window.set_cursor_grab(CursorGrabMode::None);
@@ -4777,7 +4816,7 @@ impl Game<'_> {
         // The pack prompt replaces the connecting screen (setScreen), but
         // in game it opens over the world.
         let mut batch = if self.server_packs.prompt.is_some() && self.player.is_none() {
-            HudBatch::new(size)
+            self.ui_batch(size)
         } else {
             self.hud_layers(size)
         };
@@ -4788,11 +4827,12 @@ impl Game<'_> {
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_cursor(&mut batch);
+        self.draw_touch_overlay(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
-        let mut batch = HudBatch::new(size);
-        let (w, h) = (batch.width, batch.height);
+        let mut batch = self.ui_batch(size);
+        let menu_height = batch.height;
         if self.screen == Screen::Win {
             self.draw_win_screen(&mut batch);
             return batch;
@@ -4825,6 +4865,10 @@ impl Game<'_> {
             self.draw_level_loading(&mut batch, reason);
             return batch;
         }
+        // Camera overlays and the reticle stay aligned with the full drawable.
+        // Focused screens below use the keyboard's remaining visible height.
+        batch.height = (size[1] as f32 / batch.scale).ceil();
+        let (w, h) = (batch.width, batch.height);
         // Hud.extractRenderState: F1 (keyToggleGui) hides camera overlays, the
         // crosshair, hotbar, effects, bars, sidebar, action bar, titles and chat;
         // the sleep overlay, debug screen and open screens still draw.
@@ -4997,6 +5041,7 @@ impl Game<'_> {
             let tw = HudBatch::text_width(atlas, text);
             batch.text(atlas, text, (w - tw) / 2.0, h - 59.0, u32::MAX, true);
         }
+        batch.height = menu_height;
         self.draw_chat(&mut batch);
         self.draw_tab_list(&mut batch);
         // Screen.extractBlurredBackground blurs the world and HUD, while the
@@ -6045,7 +6090,7 @@ impl Game<'_> {
         else {
             return false;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let hover = match self.slot_at(&batch, self.cursor.0, self.cursor.1) {
             None => Hover::Nothing,
             Some(slot) if slot >= Creative::DISPLAY => {
@@ -6071,7 +6116,7 @@ impl Game<'_> {
         else {
             return false;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1) else {
             return false;
         };
@@ -6231,7 +6276,7 @@ impl Game<'_> {
         let Some(r) = self.renderer.as_ref() else {
             return;
         };
-        let batch = HudBatch::new([r.config.width, r.config.height]);
+        let batch = self.ui_batch([r.config.width, r.config.height]);
         if let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1)
             && slot != 200
             && slot < Creative::DISPLAY
@@ -6247,7 +6292,7 @@ impl Game<'_> {
         let Some(r) = self.renderer.as_ref() else {
             return (None, false);
         };
-        let batch = HudBatch::new([r.config.width, r.config.height]);
+        let batch = self.ui_batch([r.config.width, r.config.height]);
         (
             self.slot_at(&batch, self.cursor.0, self.cursor.1),
             self.clicked_outside(&batch),
@@ -6477,7 +6522,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1) else {
             return;
         };
@@ -6771,6 +6816,7 @@ impl Game<'_> {
         let mut see_through = std::mem::take(&mut self.see_through_vertices);
         see_through.clear();
         self.name_tag_geometry(camera, alpha, &mut out, &mut see_through);
+        self.text_display_geometry(camera, alpha, &mut out, &mut see_through);
         self.see_through_vertices = see_through;
         // Entity shadows (EntityRenderer.extractShadow).
         if let Some(sprite) = self.gui.atlas.sprites.get("misc/shadow").copied() {
@@ -9090,21 +9136,11 @@ impl Game<'_> {
         // Options.biomeBlendRadius, ambientOcclusion and cutoutLeaves:
         // LevelExtractor.allChanged when they change.
         let (s, st) = (&self.settings, &self.streaming);
-        let remesh = (
-            s.biome_blend,
-            s.smooth_lighting,
-            s.cutout_leaves,
-            s.horizon.cull_leaves,
-        ) != (
-            st.biome_blend,
-            st.smooth_lighting,
-            st.cutout_leaves,
-            st.cull_leaves,
-        );
+        let remesh = (s.biome_blend, s.smooth_lighting, s.cutout_leaves)
+            != (st.biome_blend, st.smooth_lighting, st.cutout_leaves);
         self.streaming.biome_blend = self.settings.biome_blend;
         self.streaming.smooth_lighting = self.settings.smooth_lighting;
         self.streaming.cutout_leaves = self.settings.cutout_leaves;
-        self.streaming.cull_leaves = self.settings.horizon.cull_leaves;
         if remesh {
             self.all_sections_changed();
         }
@@ -9613,7 +9649,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let batch = HudBatch::new(size);
+        let batch = self.ui_batch(size);
         let (ox, oy) = Self::creative_origin(&batch);
         let (cx, cy) = self.cursor;
         let tabs = self.creative_screen.tabs.clone();
@@ -9932,7 +9968,7 @@ impl Game<'_> {
         // GameRenderer.render3dHud: the debug crosshair, first person with the HUD shown.
         let mut crosshair = horizon_client::gizmos::Gizmos::default();
         if self.debug_crosshair() && self.camera_type.first_person() && !self.ui.hide_gui {
-            let scale = HudBatch::new(size).scale;
+            let scale = self.ui_batch(size).scale;
             crosshair.debug_crosshair(at, view_pitch, view_yaw, scale);
         }
         let debug_lines = horizon_client::gizmos::camera_relative(&lines, at, view);
@@ -10448,6 +10484,10 @@ impl Game<'_> {
     }
     /// A mouse button while playing (window or control socket).
     fn play_mouse(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
+        #[cfg(target_os = "ios")]
+        if !pressed && self.mobile_input_held(Err(button)) {
+            return Ok(());
+        }
         if self.sleeping.is_some() {
             return Ok(());
         }
@@ -10719,6 +10759,8 @@ impl Game<'_> {
 }
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        self.mobile_resume();
         if self.window.is_some() {
             return;
         }
@@ -10766,6 +10808,49 @@ impl ApplicationHandler for Game<'_> {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
+        #[cfg(target_os = "ios")]
+        if self.mobile.suspended && matches!(event, WindowEvent::RedrawRequested) {
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        if self.mobile_owns_input()
+            && !matches!(
+                event,
+                WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::Focused(_)
+            )
+        {
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_some()
+            && !matches!(
+                event,
+                WindowEvent::Touch(_)
+                    | WindowEvent::RedrawRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::Focused(_)
+            )
+        {
+            return;
+        }
+        if let WindowEvent::Touch(touch) = &event {
+            if let Err(error) = self.touch_input(
+                event_loop,
+                touch.id,
+                touch.phase,
+                touch.location.x,
+                touch.location.y,
+            ) {
+                log::warn!("Horizon touch: {error}");
+            }
+            return;
+        }
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::Resized(_))
+            && let Err(error) = self.cancel_touch_input(event_loop)
+        {
+            log::warn!("Horizon touch release: {error}");
+        }
+
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && let PhysicalKey::Code(key) = event.physical_key
         {
@@ -10775,8 +10860,18 @@ impl ApplicationHandler for Game<'_> {
                 self.physical_keys.remove(&key);
             }
         }
+        #[cfg(target_os = "ios")]
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if *state == ElementState::Pressed {
+                self.physical_mouse.insert(*button);
+            } else {
+                self.physical_mouse.remove(button);
+            }
+        }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
+            #[cfg(target_os = "ios")]
+            self.physical_mouse.clear();
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
@@ -10904,7 +10999,7 @@ impl ApplicationHandler for Game<'_> {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(r) = &self.renderer {
-                        let b = HudBatch::new([r.config.width, r.config.height]);
+                        let b = self.ui_batch([r.config.width, r.config.height]);
                         self.cursor = (position.x as f32 / b.scale, position.y as f32 / b.scale);
                         if self.screen == Screen::Advancements {
                             self.advancements_drag();
@@ -10953,7 +11048,8 @@ impl ApplicationHandler for Game<'_> {
                             .as_ref()
                             .map(|w| w.inner_size())
                             .unwrap_or_default();
-                        let batch = HudBatch::new([size.width, size.height]);
+                        let batch =
+                            menu_viewport::batch(self.window.as_deref(), [size.width, size.height]);
                         title.scroll_worlds(d, self.cursor, (batch.width, batch.height));
                     }
                     if self.screen == Screen::Playing
@@ -11043,7 +11139,7 @@ impl ApplicationHandler for Game<'_> {
                         .as_ref()
                         .map(|r| [r.config.width, r.config.height])
                         .unwrap_or([1, 1]);
-                    let b = HudBatch::new(size);
+                    let b = self.ui_batch(size);
                     let atlas = &self.gui.atlas;
                     let shift = self.has_shift_down();
                     let (action, sound) = self.title.as_mut().map_or((Action::None, false), |t| {
@@ -11128,12 +11224,16 @@ impl ApplicationHandler for Game<'_> {
                             self.extras_mouse(button, pressed);
                             match self.settings.keys.translate_mouse(button) {
                                 Some(Err(b)) => self.play_mouse(b, pressed)?,
-                                Some(Ok(k)) if pressed => {
-                                    self.keys.insert(k);
-                                    self.key_pressed(k)?;
-                                }
                                 Some(Ok(k)) => {
-                                    self.keys.remove(&k);
+                                    #[cfg(target_os = "ios")]
+                                    self.mapped_key(k, pressed, false)?;
+                                    #[cfg(not(target_os = "ios"))]
+                                    if pressed {
+                                        self.keys.insert(k);
+                                        self.key_pressed(k)?;
+                                    } else {
+                                        self.keys.remove(&k);
+                                    }
                                 }
                                 None => {}
                             }
@@ -11419,6 +11519,8 @@ impl ApplicationHandler for Game<'_> {
                         if self.title.is_none() && !self.pause {
                             let tick = Instant::now();
                             horizon_client::spans::time("tick", || self.tick())?;
+                            #[cfg(target_os = "ios")]
+                            self.touch_player_tick(event_loop)?;
                             // In single player the tick is the integrated server's.
                             if self.remote.is_none() {
                                 self.perf.tick(tick.elapsed().as_secs_f32() * 1000.0);
@@ -11561,6 +11663,10 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_some() || self.mobile_owns_input() {
+            return;
+        }
         if self.pending_save.is_none()
             && self.captured
             && self.focused
@@ -11573,6 +11679,14 @@ impl ApplicationHandler for Game<'_> {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        {
+            self.mobile_poll(event_loop);
+            if self.mobile.suspended {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
+        }
         if self.pending_save.is_some() {
             match self.poll_closing_save() {
                 Ok(true) => event_loop.exit(),
@@ -11602,7 +11716,12 @@ impl ApplicationHandler for Game<'_> {
         if self.pending_save.is_some() {
             return;
         }
+        #[cfg(not(target_os = "ios"))]
         self.poll_pads(event_loop);
+        #[cfg(target_os = "ios")]
+        if self.touch_editor.is_none() && !self.mobile_owns_input() {
+            self.poll_pads(event_loop);
+        }
         if self.options.frames.is_some() && self.started.elapsed() > self.options.timeout {
             self.error = Some("frame-limited run timed out".into());
             event_loop.exit();
@@ -11743,6 +11862,8 @@ impl<'a> Game<'a> {
             },
             keys: HashSet::new(),
             physical_keys: HashSet::new(),
+            #[cfg(target_os = "ios")]
+            physical_mouse: HashSet::new(),
             left: false,
             right: false,
             cursor: (0.0, 0.0),
@@ -11769,6 +11890,11 @@ impl<'a> Game<'a> {
             previous: now,
             last_input: now,
             pad: Default::default(),
+            touch: mobile_touch_controls(),
+            #[cfg(target_os = "ios")]
+            touch_editor: None,
+            #[cfg(target_os = "ios")]
+            mobile: Default::default(),
             frames: 0,
             world_frames: 0,
             fps: 0.0,
@@ -11893,6 +12019,8 @@ impl<'a> Game<'a> {
             breath_clouds: Vec::new(),
             dragon_model: prepared.dragon_model,
             map_patches: Vec::new(),
+            text_displays: Default::default(),
+            text_display_vertices: 0,
             skin_downloads: RefCell::new(horizon_client::skins::Downloader::new(
                 std::env::current_dir()
                     .unwrap_or_default()
@@ -12748,6 +12876,7 @@ fn start_game<'a>(
         game.open_options_at(true, horizon_client::options_ui::Page::Packs);
         game.ui.options.resource_error = Some(error);
     }
+    #[cfg(not(target_os = "ios"))]
     if game.options.benchmark.is_some() {
         // The same conditions on every machine: no VSync, no frame cap, no
         // pause or idle limit without focus. In memory only, never saved.
@@ -12763,6 +12892,7 @@ fn start_game<'a>(
         game.start_mods();
     }
     game.start_agent_control()?;
+    #[cfg(not(target_os = "ios"))]
     if let Some(scenario) = game.options.benchmark.clone() {
         let control = game
             .control
@@ -12785,6 +12915,10 @@ fn start_game<'a>(
                 game_dir: std::env::current_dir()?,
             },
         );
+    }
+    #[cfg(target_os = "ios")]
+    if let Some(scenario) = game.options.benchmark.clone() {
+        game.mobile_begin_benchmark(scenario, started)?;
     }
     if let Ok(spec) = std::env::var("HORIZON_DISPENSE_FIXTURE") {
         game.dispense_fixture(&spec)?;
@@ -12878,6 +13012,10 @@ fn run_event_loop(mut game: Game<'_>) -> Result<()> {
 
 /// The loading screen's state while the worker loads the resources.
 struct Loading {
+    #[cfg(target_os = "ios")]
+    mobile_suspended: bool,
+    #[cfg(target_os = "ios")]
+    mobile_edit_touch: bool,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     gui: Option<UiResources>,
@@ -12898,6 +13036,17 @@ struct Loading {
 }
 impl Loading {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        {
+            if self.mobile_suspended {
+                if let Some(r) = &mut self.renderer {
+                    if let Err(e) = r.recreate_surface() {
+                        self.error = Some(e);
+                    }
+                }
+            }
+            self.mobile_suspended = false;
+        }
         if self.window.is_some() {
             return;
         }
@@ -12956,6 +13105,14 @@ impl Loading {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
+        #[cfg(target_os = "ios")]
+        if let WindowEvent::Touch(touch) = &event {
+            if let Err(error) = self.mobile_touch(event_loop, touch) {
+                self.error = Some(error);
+                event_loop.exit();
+            }
+            return;
+        }
         if let Err(error) = self.menu_event(event_loop, event) {
             self.error = Some(error);
             event_loop.exit();
@@ -12996,6 +13153,18 @@ impl Loading {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        {
+            if self.mobile_suspended {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
+            if let Err(error) = mobile::poll_loading(self) {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        }
         if let Err(error) = self.poll_menu_resources() {
             self.error = Some(error);
             event_loop.exit();
@@ -13018,7 +13187,7 @@ impl Loading {
         else {
             return;
         };
-        let mut batch = HudBatch::new(size);
+        let mut batch = self.ui_batch(size);
         self.draw_menu(&mut batch);
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
@@ -13104,6 +13273,10 @@ impl Loading {
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
         self.menu.handoff(&mut game);
+        #[cfg(target_os = "ios")]
+        if self.mobile_edit_touch {
+            game.begin_touch_edit();
+        }
         game.apply_settings();
         game.previous = Instant::now();
         log::info!(
@@ -13119,18 +13292,50 @@ impl Loading {
 /// The application: the loading screen until the resources are ready, then
 /// the game itself, on the same event loop and window.
 enum App {
+    #[cfg(target_os = "ios")]
+    Setup(Box<mobile::Setup>),
     Loading(Box<Loading>),
     Ready(Box<Game<'static>>),
 }
 impl ApplicationHandler for App {
+    #[cfg(target_os = "ios")]
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Setup(setup) => setup.suspend(),
+            App::Loading(loading) => {
+                loading.mobile_suspended = true;
+                if let Some(r) = &mut loading.renderer {
+                    r.release_surface();
+                }
+            }
+            App::Ready(game) => game.mobile_suspend(event_loop),
+        }
+    }
+    #[cfg(target_os = "ios")]
+    fn memory_warning(&mut self, _: &ActiveEventLoop) {
+        match self {
+            App::Setup(_) => {}
+            App::Loading(loading) => {
+                if let Some(r) = &mut loading.renderer {
+                    r.trim_unused_memory();
+                }
+            }
+            App::Ready(game) => game.mobile_memory_warning(),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match self {
+            #[cfg(target_os = "ios")]
+            App::Setup(setup) => setup.resumed(event_loop),
             App::Loading(loading) => loading.resumed(event_loop),
             App::Ready(game) => game.resumed(event_loop),
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match self {
+            #[cfg(target_os = "ios")]
+            App::Setup(setup) => setup.window_event(event_loop, id, event),
             App::Loading(loading) => loading.window_event(event_loop, id, event),
             App::Ready(game) => game.window_event(event_loop, id, event),
         }
@@ -13141,6 +13346,13 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        if let App::Setup(setup) = self {
+            if let Some(loading) = setup.poll(event_loop) {
+                *self = App::Loading(Box::new(loading));
+            }
+            return;
+        }
         enum Step {
             Waiting,
             Ready(Box<Game<'static>>),
@@ -13148,6 +13360,8 @@ impl ApplicationHandler for App {
             Failed(Box<dyn std::error::Error>),
         }
         let step = match self {
+            #[cfg(target_os = "ios")]
+            App::Setup(_) => unreachable!("setup handled above"),
             App::Ready(game) => {
                 game.about_to_wait(event_loop);
                 return;
@@ -13194,18 +13408,22 @@ impl ApplicationHandler for App {
 
 /// The ordinary launch: load the resources on a worker while the window shows
 /// the loading screen, then swap in the game on the main thread.
-fn run_loading(
+fn make_loading(
     options: Options,
     settings: Settings,
     vanilla_root: PathBuf,
     pack_error: Option<String>,
     started: Instant,
-) -> Result<()> {
+) -> Result<Loading> {
     let progress = Progress::new();
     let (receiver, loader) =
         startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
     let menu = startup_menu::StartupMenu::new(&options, pack_error.as_deref())?;
     let loading = Loading {
+        #[cfg(target_os = "ios")]
+        mobile_suspended: false,
+        #[cfg(target_os = "ios")]
+        mobile_edit_touch: false,
         window: None,
         renderer: None,
         gui: None,
@@ -13224,9 +13442,26 @@ fn run_loading(
         menu,
         error: None,
     };
-    let mut app = App::Loading(Box::new(loading));
+    Ok(loading)
+}
+fn run_loading(
+    options: Options,
+    settings: Settings,
+    vanilla_root: PathBuf,
+    pack_error: Option<String>,
+    started: Instant,
+) -> Result<()> {
+    let mut app = App::Loading(Box::new(make_loading(
+        options,
+        settings,
+        vanilla_root,
+        pack_error,
+        started,
+    )?));
     EventLoop::new()?.run_app(&mut app)?;
     match app {
+        #[cfg(target_os = "ios")]
+        App::Setup(_) => {}
         App::Ready(mut game) => {
             write_report(&game)?;
             if let Some(e) = game.error.take() {
@@ -13568,4 +13803,27 @@ mod tests {
             }
         }
     }
+}
+
+/// Load saved touch layout independently of vanilla's options file.
+fn mobile_touch_controls() -> horizon_client::touch::TouchControls {
+    let controls = horizon_client::touch::TouchControls::default();
+    #[cfg(target_os = "ios")]
+    let mut controls = controls;
+    #[cfg(target_os = "ios")]
+    {
+        let layout = match touch::load_saved_touch_layout() {
+            Ok(layout) => layout,
+            Err(error) => {
+                log::warn!("Touch controls preference: {error}");
+                horizon_client::touch::TouchLayout::default()
+            }
+        };
+        controls.set_layout(layout);
+    }
+    controls
+}
+#[cfg(target_os = "ios")]
+pub fn run_with_config(config: horizon_client::launch::LaunchConfig) -> Result<()> {
+    mobile::run(config)
 }

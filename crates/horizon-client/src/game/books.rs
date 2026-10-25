@@ -740,7 +740,7 @@ impl Game<'_> {
         }
     }
     pub(super) fn book_click(&mut self, size: [u32; 2]) {
-        let b = HudBatch::new(size);
+        let b = self.ui_batch(size);
         let (w, left) = (b.width, ((b.width - 192.0) / 2.0).floor());
         let (mx, my) = self.cursor;
         let inside =

@@ -113,6 +113,13 @@ fn labelled(key: &str, value: Text) -> Text {
 }
 
 impl WorldOptions {
+    /// Whether the visible world-options page has an active text field.
+    #[cfg(target_os = "ios")]
+    pub(super) fn mobile_text_focused(&self) -> bool {
+        self.rules.as_ref().is_some_and(RulesScreen::typing)
+            || (self.view == View::Options && self.lan && self.port.focused)
+    }
+
     /// Vanilla 26.3 WorldOptionsScreen.generalOptions: guests see difficulty,
     /// game rules and restrictions; game modes, commands and LAN are host-only.
     fn visible_buttons(&self, w: f32) -> Vec<(Button, f32, f32, f32)> {
@@ -447,6 +454,13 @@ impl Restrictions {
 }
 
 impl Game<'_> {
+    #[cfg(target_os = "ios")]
+    pub(super) fn world_options_mobile_text_focused(&self) -> bool {
+        self.world_options
+            .as_ref()
+            .is_some_and(WorldOptions::mobile_text_focused)
+    }
+
     pub(super) fn remote_world_options_permission(&mut self, permission: bool) {
         if let Some(o) = self.world_options.as_mut() {
             let lost = o.gamemaster && !permission;

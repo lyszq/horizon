@@ -9,6 +9,7 @@ permissions:
   actions: write
 jobs:
   cancel:
+    if: github.repository == 'ludovic111/horizon'
     runs-on: ubuntu-latest
     steps:
       - name: Cancel the pull request's unfinished runs

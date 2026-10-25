@@ -90,7 +90,7 @@ impl Game<'_> {
             .renderer
             .as_ref()
             .map_or([1280, 720], |r| [r.config.width, r.config.height]);
-        let b = HudBatch::new(size);
+        let b = self.ui_batch(size);
         (b.width, b.height)
     }
     /// Open the options screens (OptionsScreen) from the title or pause menu.

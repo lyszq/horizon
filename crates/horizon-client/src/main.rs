@@ -4,6 +4,7 @@ mod game;
 
 use horizon_client::{crash, logging};
 
+#[cfg(not(target_os = "ios"))]
 fn main() {
     horizon_client::telemetry::mark_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,4 +35,26 @@ fn main() {
         std::process::exit(1);
     }
     logging::flush();
+}
+
+#[cfg(target_os = "ios")]
+fn main() {
+    let Some(sandbox) = std::env::var_os("HOME") else {
+        eprintln!("Horizon: iPad application sandbox is unavailable");
+        return;
+    };
+    let config = horizon_client::launch::LaunchConfig::ipad(std::path::Path::new(&sandbox));
+    if let Err(error) = config
+        .enter_home()
+        .and_then(|()| config.initialize_options())
+    {
+        eprintln!("Horizon: cannot initialize iPad data: {error}");
+        return;
+    }
+    logging::init(&config.paths.home, "Render thread");
+    crash::install(config.paths.home.clone(), "client");
+    if let Err(error) = game::run_with_config(config) {
+        log::error!("Horizon iPad: {error}");
+        logging::flush();
+    }
 }

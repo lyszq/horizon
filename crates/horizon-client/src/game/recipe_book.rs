@@ -562,7 +562,7 @@ impl Game<'_> {
     }
     fn batch_for_size(&self) -> Option<HudBatch> {
         let r = self.renderer.as_ref()?;
-        Some(HudBatch::new([r.config.width, r.config.height]))
+        Some(self.ui_batch([r.config.width, r.config.height]))
     }
 
     // ---- clicks ----

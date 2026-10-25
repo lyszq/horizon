@@ -1,0 +1,289 @@
+name: iOS package
+
+on:
+  push:
+    branches: [main, ios/ipad]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  HORIZON_COMMIT: ${{ github.sha }}
+  IOS_APP_VERSION: "0.2.54"
+  IOS_MINIMUM_OS: "26.0"
+  CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+
+jobs:
+  verify:
+    # The upstream checks workflow intentionally skips forks; keep this PR's
+    # Linux regression evidence independent from the Apple build below.
+    if: github.repository != 'ludovic111/horizon'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      HORIZON_TELEMETRY_URL: "off"
+      HORIZON_LAUNCHER_NO_SELF_UPDATE: "1"
+      HORIZON_NO_AUDIO: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux audio and device headers
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+
+      - name: Install Rust 1.99.1 with lint components
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy,rustfmt
+
+      # Cache Cargo registry/git data and target/ only; runtime data stays in fresh runner-temp homes.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-verify-v1
+          cache-on-failure: true
+          workspaces: ". -> target"
+
+      - name: Create isolated runtime homes
+        run: |
+          root="$RUNNER_TEMP/horizon-runtime"
+          mkdir -p "$root"
+          {
+            printf 'HORIZON_HOME=%s\n' "$(mktemp -d "$root/game.XXXXXXXX")"
+            printf 'HORIZON_LAUNCHER_HOME=%s\n' "$(mktemp -d "$root/launcher.XXXXXXXX")"
+            printf 'XDG_DATA_HOME=%s\n' "$(mktemp -d "$root/xdg-data.XXXXXXXX")"
+            printf 'XDG_CONFIG_HOME=%s\n' "$(mktemp -d "$root/xdg-config.XXXXXXXX")"
+          } >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy -p horizon-client --lib --bin horizon-client --locked -- -D warnings
+
+      - name: Run asset-free Rust tests
+        run: cargo test -p horizon-client --lib --bin horizon-client --locked
+
+      - name: Verify the merged upstream libraries
+        run: cargo test --locked -p horizon-core -p horizon-world -p horizon-protocol -p horizon-assets -p horizon-bench -p horizon-shaders -p horizon-mods -p horizon-port-pack -p horizon-prepare --lib --features horizon-mods/index
+
+      - name: Test iOS package builder
+        run: python3 -m unittest discover -s tests -p 'test_package_ios.py' -v
+
+      - name: Test iPad resource preparation
+        run: python3 -m unittest discover -s tests -p 'test_prepare_ipad_resources.py' -v
+
+      - name: Test public-tree guard
+        run: python3 -m unittest discover -s tests -p 'test_public_tree.py' -v
+
+      - name: Check all tracked history for private game data
+        run: python3 tools/check_public_tree.py --history
+
+      - name: Test iOS integration artifact contract
+        run: python3 -m unittest discover -s tests -p 'test_ios_integration_contract.py' -v
+
+  package-and-smoke:
+    # Public GitHub-hosted Apple Silicon runner only; no project runner labels or signing secrets.
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install stable Rust and both Apple Silicon targets
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      # This cache contains Cargo's registry/git data and target/ build outputs only.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-arm64-v1
+          cache-on-failure: true
+          workspaces: ". -> target"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/ios/ipad' }}
+
+      - name: Test the package builder with synthetic binaries and icons
+        run: python3 -m unittest discover -s tests -p 'test_package_ios.py' -v
+
+      - name: Record the selected public toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/horizon-ios/device" "$RUNNER_TEMP/horizon-ios/simulator" "$RUNNER_TEMP/horizon-ios/evidence" "$RUNNER_TEMP/horizon-ios-symbols"
+          rustc -Vv | tee "$RUNNER_TEMP/horizon-ios/rustc-version.txt"
+          cargo -V | tee "$RUNNER_TEMP/horizon-ios/cargo-version.txt"
+          xcodebuild -version | tee "$RUNNER_TEMP/horizon-ios/xcode-version.txt"
+          xcode-select -p | tee "$RUNNER_TEMP/horizon-ios/xcode-developer-dir.txt"
+          xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/horizon-ios/iphoneos-sdk-version.txt"
+          xcrun --sdk iphonesimulator --show-sdk-version | tee "$RUNNER_TEMP/horizon-ios/iphonesimulator-sdk-version.txt"
+          grep -Fxq 'Xcode 26.6' "$RUNNER_TEMP/horizon-ios/xcode-version.txt"
+          grep -Fxq 'Build version 17F113' "$RUNNER_TEMP/horizon-ios/xcode-version.txt"
+          grep -Fxq "$DEVELOPER_DIR" "$RUNNER_TEMP/horizon-ios/xcode-developer-dir.txt"
+          test "$(cat "$RUNNER_TEMP/horizon-ios/iphoneos-sdk-version.txt")" = "26.5"
+          test "$(cat "$RUNNER_TEMP/horizon-ios/iphonesimulator-sdk-version.txt")" = "26.5"
+
+      - name: Build device arm64 executable and dSYM
+        run: |
+          sdkroot="$(xcrun --sdk iphoneos --show-sdk-path)"
+          sdkversion="$(xcrun --sdk iphoneos --show-sdk-version)"
+          export SDKROOT="$sdkroot"
+          export IPHONEOS_DEPLOYMENT_TARGET="$IOS_MINIMUM_OS"
+          cargo build --locked --release --target aarch64-apple-ios --no-default-features --features audio,ios -p horizon-client --bin horizon-client
+          binary="target/aarch64-apple-ios/release/horizon-client"
+          test -x "$binary"
+          xcrun vtool -show-build "$binary" | tee "$RUNNER_TEMP/horizon-ios/device/vtool.txt"
+          grep -Eq 'Minimum OS: 26\.0|minos 26\.0' "$RUNNER_TEMP/horizon-ios/device/vtool.txt"
+          dsym="$RUNNER_TEMP/horizon-ios-symbols/Horizon-device.app.dSYM"
+          xcrun dsymutil --out "$dsym" "$binary"
+          test -s "$dsym/Contents/Resources/DWARF/horizon-client"
+          python3 tools/package_ios.py --target device --binary "$binary" --output-dir "$RUNNER_TEMP/horizon-ios/device" --commit "$GITHUB_SHA" --version "$IOS_APP_VERSION" --build-number "$GITHUB_RUN_NUMBER" --minimum-os "$IOS_MINIMUM_OS" --sdk-version "$sdkversion" --rustc-version "$(tr '\n' ' ' < "$RUNNER_TEMP/horizon-ios/rustc-version.txt")" --cargo-version "$(cat "$RUNNER_TEMP/horizon-ios/cargo-version.txt")" --xcode-version "$(tr '\n' ' ' < "$RUNNER_TEMP/horizon-ios/xcode-version.txt")" --dsym "$dsym"
+          ditto -c -k --keepParent "$dsym" "$RUNNER_TEMP/horizon-ios/device/Horizon-device.app.dSYM.zip"
+          shasum -a 256 "$RUNNER_TEMP/horizon-ios/device/Horizon-device.app.dSYM.zip" > "$RUNNER_TEMP/horizon-ios/device/Horizon-device.app.dSYM.zip.sha256"
+
+      - name: Build simulator arm64 executable and dSYM
+        run: |
+          sdkroot="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          sdkversion="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          export SDKROOT="$sdkroot"
+          export IPHONEOS_DEPLOYMENT_TARGET="$IOS_MINIMUM_OS"
+          cargo build --locked --release --target aarch64-apple-ios-sim --no-default-features --features audio,ios -p horizon-client --bin horizon-client
+          binary="target/aarch64-apple-ios-sim/release/horizon-client"
+          test -x "$binary"
+          xcrun vtool -show-build "$binary" | tee "$RUNNER_TEMP/horizon-ios/simulator/vtool.txt"
+          grep -Eq 'Minimum OS: 26\.0|minos 26\.0' "$RUNNER_TEMP/horizon-ios/simulator/vtool.txt"
+          dsym="$RUNNER_TEMP/horizon-ios-symbols/Horizon-simulator.app.dSYM"
+          xcrun dsymutil --out "$dsym" "$binary"
+          test -s "$dsym/Contents/Resources/DWARF/horizon-client"
+          python3 tools/package_ios.py --target simulator --binary "$binary" --output-dir "$RUNNER_TEMP/horizon-ios/simulator" --commit "$GITHUB_SHA" --version "$IOS_APP_VERSION" --build-number "$GITHUB_RUN_NUMBER" --minimum-os "$IOS_MINIMUM_OS" --sdk-version "$sdkversion" --rustc-version "$(tr '\n' ' ' < "$RUNNER_TEMP/horizon-ios/rustc-version.txt")" --cargo-version "$(cat "$RUNNER_TEMP/horizon-ios/cargo-version.txt")" --xcode-version "$(tr '\n' ' ' < "$RUNNER_TEMP/horizon-ios/xcode-version.txt")" --dsym "$dsym" --adhoc-sign
+          codesign --verify --strict "$RUNNER_TEMP/horizon-ios/simulator/Horizon.app"
+          ditto -c -k --keepParent "$dsym" "$RUNNER_TEMP/horizon-ios/simulator/Horizon-simulator.app.dSYM.zip"
+          shasum -a 256 "$RUNNER_TEMP/horizon-ios/simulator/Horizon-simulator.app.dSYM.zip" > "$RUNNER_TEMP/horizon-ios/simulator/Horizon-simulator.app.dSYM.zip.sha256"
+
+      - name: Launch on an iPad simulator and verify the Metal smoke report
+        run: |
+          device_json="$RUNNER_TEMP/horizon-ios/evidence/sim-devices.json"
+          runtime_json="$RUNNER_TEMP/horizon-ios/evidence/sim-runtimes.json"
+          xcrun simctl list devices available --json > "$device_json"
+          xcrun simctl list runtimes --json > "$runtime_json"
+          udid="$(python3 - "$device_json" "$runtime_json" <<'PY'
+          import json, sys
+          devices = json.load(open(sys.argv[1], encoding="utf-8"))["devices"]
+          runtimes = json.load(open(sys.argv[2], encoding="utf-8"))["runtimes"]
+          available = {runtime["identifier"] for runtime in runtimes if runtime.get("isAvailable") and runtime.get("version", "").startswith("26.")}
+          candidates = [(runtime, device) for runtime, values in devices.items() if runtime in available for device in values if device.get("isAvailable") and "ipad" in device.get("name", "").lower()]
+          if not candidates:
+              raise SystemExit("No available iOS 26 iPad simulator on this runner")
+          candidates.sort(key=lambda item: (item[0], "pro" in item[1]["name"].lower(), item[1]["name"]), reverse=True)
+          print(candidates[0][1]["udid"])
+          PY
+          )"
+          echo "Using iPad simulator $udid"
+          printf '%s\n' "$udid" > "$RUNNER_TEMP/horizon-ios/evidence/simulator-udid.txt"
+          xcrun simctl boot "$udid" 2>/dev/null || true
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" "$RUNNER_TEMP/horizon-ios/simulator/Horizon.app"
+          xcrun simctl spawn "$udid" launchctl setenv HORIZON_IOS_SMOKE 1
+          xcrun simctl launch --terminate-running-process "$udid" dev.lyszq.horizon | tee "$RUNNER_TEMP/horizon-ios/evidence/launch.log"
+
+          report="$RUNNER_TEMP/horizon-ios/evidence/horizon-ios-smoke.json"
+          for attempt in $(seq 1 45); do
+            container="$(xcrun simctl get_app_container "$udid" dev.lyszq.horizon data 2>/dev/null || true)"
+            if [[ -n "$container" && -s "$container/Documents/horizon-ios-smoke.json" ]]; then
+              cp "$container/Documents/horizon-ios-smoke.json" "$report"
+              break
+            fi
+            sleep 2
+          done
+          test -s "$report" || { echo "Smoke report was not written to the app data container"; exit 1; }
+          python3 - "$report" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report.get("schema") == 1, report
+          assert report.get("status") == "pass", report
+          assert report.get("scope") == "bootstrap-metal", report
+          assert isinstance(report.get("frames"), int) and report["frames"] >= 3, report
+          assert isinstance(report.get("ticks"), int) and report["ticks"] >= 1, report
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+          xcrun simctl io "$udid" screenshot "$RUNNER_TEMP/horizon-ios/evidence/horizon-ios-smoke.png"
+          test -s "$RUNNER_TEMP/horizon-ios/evidence/horizon-ios-smoke.png"
+          xcrun simctl spawn "$udid" log show --last 2m --style compact --predicate 'process == "Horizon"' > "$RUNNER_TEMP/horizon-ios/evidence/simulator.log" || true
+
+      - name: Collect simulator failure diagnostics
+        if: always()
+        run: |
+          set +e
+          diagnostics="$RUNNER_TEMP/horizon-ios/evidence/diagnostics"
+          mkdir -p "$diagnostics"
+          evidence="$RUNNER_TEMP/horizon-ios/evidence"
+          for name in launch.log simulator.log horizon-ios-smoke.json horizon-ios-smoke.png sim-devices.json sim-runtimes.json simulator-udid.txt; do
+            if [[ -s "$evidence/$name" ]]; then
+              cp -p "$evidence/$name" "$diagnostics/$name"
+            fi
+          done
+
+          udid_file="$evidence/simulator-udid.txt"
+          if [[ -s "$udid_file" ]]; then
+            udid="$(cat "$udid_file")"
+            xcrun simctl io "$udid" screenshot "$diagnostics/simulator-final.png" >/dev/null 2>&1
+            xcrun simctl spawn "$udid" log show --last 10m --style compact --predicate 'process == "Horizon"' > "$diagnostics/simulator-last-10m.log" 2>&1
+            container="$(xcrun simctl get_app_container "$udid" dev.lyszq.horizon data 2>/dev/null)"
+            if [[ -n "$container" && -d "$container" ]]; then
+              for relative in \
+                "Documents/horizon-ios-smoke.json" \
+                "Library/Application Support/Horizon/logs" \
+                "Library/Application Support/Horizon/crash-reports"; do
+                source="$container/$relative"
+                if [[ -f "$source" ]]; then
+                  mkdir -p "$diagnostics/app-container/$(dirname "$relative")"
+                  cp -p "$source" "$diagnostics/app-container/$relative"
+                elif [[ -d "$source" ]]; then
+                  mkdir -p "$diagnostics/app-container/$(dirname "$relative")"
+                  cp -Rp "$source" "$diagnostics/app-container/$(dirname "$relative")/"
+                fi
+              done
+            fi
+          fi
+
+          reports="$HOME/Library/Logs/DiagnosticReports"
+          if [[ -d "$reports" ]]; then
+            find "$reports" -maxdepth 1 -type f \
+              \( -iname 'Horizon*.ips' -o -iname 'Horizon*.crash' \) \
+              -exec cp -p {} "$diagnostics/" \; 2>/dev/null
+          fi
+          exit 0
+
+      - name: Upload packages, symbols, simulator report, and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-ios-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/horizon-ios/**
+          if-no-files-found: warn
+          retention-days: 14

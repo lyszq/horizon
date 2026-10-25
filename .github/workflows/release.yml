@@ -42,9 +42,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   decide:
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    if: github.repository == 'ludovic111/horizon' && (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -79,7 +77,7 @@ jobs:
 
   build:
     needs: decide
-    if: needs.decide.outputs.release == 'true'
+    if: github.repository == 'ludovic111/horizon' && (needs.decide.outputs.release == 'true')
     name: build ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -280,6 +278,7 @@ jobs:
         run: packaging/macos/keychain.sh lock
 
   sign:
+    if: github.repository == 'ludovic111/horizon'
     needs: [decide, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -321,6 +320,7 @@ jobs:
           retention-days: 3
 
   publish:
+    if: github.repository == 'ludovic111/horizon'
     needs: [decide, build, sign]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -367,10 +367,15 @@ jobs:
           TAG: ${{ needs.decide.outputs.tag }}
         run: |
           signature=(); [[ -f dist/SHA256SUMS.sig ]] && signature=(dist/SHA256SUMS.sig)
-          # The release and the latest at once: there is one channel (docs/release-flow.md).
+          # The release and the latest at once: there is one channel (docs/release-flow.md). Each archive gets a
+          # label (file#label), which GitHub's page shows instead of the file name, so nobody takes the game's
+          # files for the download (#1647). Launchers, servers and install.sh match the name, which stays.
           gh release create "$TAG" --target "${{ needs.decide.outputs.head }}" --title "$(cat notes/title.txt)" \
-            --notes-file notes/body.md --latest dist/horizon-linux-x86_64.tar.gz \
-            dist/horizon-windows-x64.zip dist/horizon-macos-arm64.zip dist/horizon-server-linux-x86_64.tar.gz \
+            --notes-file notes/body.md --latest \
+            "dist/horizon-linux-x86_64.tar.gz#Game files the launcher installs: Linux (horizon-linux-x86_64.tar.gz)" \
+            "dist/horizon-windows-x64.zip#Game files the launcher installs: Windows (horizon-windows-x64.zip)" \
+            "dist/horizon-macos-arm64.zip#Game files the launcher installs: macOS (horizon-macos-arm64.zip)" \
+            "dist/horizon-server-linux-x86_64.tar.gz#Dedicated server for Linux (horizon-server-linux-x86_64.tar.gz)" \
             dist/SHA256SUMS "${signature[@]}" dist/smoke-test.json
       - name: Dry run, the release that would be published
         if: needs.decide.outputs.dry_run == 'true'

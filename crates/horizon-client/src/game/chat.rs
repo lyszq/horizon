@@ -410,7 +410,7 @@ impl Game<'_> {
             .renderer
             .as_ref()
             .map_or([1280, 720], |r| [r.config.width, r.config.height]);
-        let b = HudBatch::new(size);
+        let b = self.ui_batch(size);
         let m = Measure(&self.gui.atlas.font);
         let c = Commands {
             dispatcher: chat_tree(&self.remote, &self.mods),
@@ -596,7 +596,7 @@ impl Game<'_> {
     pub(super) fn chat_scroll(&mut self, amount: f32) {
         let cursor = self.cursor;
         let height = self.renderer.as_ref().map_or(720.0, |r| {
-            HudBatch::new([r.config.width, r.config.height]).height
+            self.ui_batch([r.config.width, r.config.height]).height
         });
         let _ = height;
         let mouse = (cursor.0.floor() as i32, cursor.1.floor() as i32);
@@ -612,7 +612,7 @@ impl Game<'_> {
     pub(super) fn chat_click(&mut self) {
         let cursor = self.cursor;
         let height = self.renderer.as_ref().map_or(720.0, |r| {
-            HudBatch::new([r.config.width, r.config.height]).height
+            self.ui_batch([r.config.width, r.config.height]).height
         });
         let m = Measure(&self.gui.atlas.font);
         let c = Commands {

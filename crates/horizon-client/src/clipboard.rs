@@ -112,6 +112,7 @@ pub trait Clipboard {
 /// game can still be pasted in the game.
 #[derive(Default)]
 pub struct SystemClipboard {
+    #[cfg(not(target_os = "ios"))]
     system: Option<arboard::Clipboard>,
     /// The text Horizon last copied (`horizon-ctl status`).
     copied: Option<String>,
@@ -122,6 +123,7 @@ impl SystemClipboard {
     pub fn copied(&self) -> Option<&str> {
         self.copied.as_deref()
     }
+    #[cfg(not(target_os = "ios"))]
     fn system(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.system.is_none() {
             self.system = arboard::Clipboard::new().ok();
@@ -132,16 +134,23 @@ impl SystemClipboard {
 
 impl Clipboard for SystemClipboard {
     fn get(&mut self) -> String {
-        let Some(system) = self.system() else {
-            return self.copied.clone().unwrap_or_default();
-        };
-        match system.get_text() {
-            Ok(text) => text,
-            Err(arboard::Error::ContentNotAvailable) => String::new(),
-            Err(_) => {
-                // A lost connection (a restarted compositor): reconnect next time.
-                self.system = None;
-                String::new()
+        #[cfg(target_os = "ios")]
+        {
+            return horizon_ios_platform::clipboard_get();
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let Some(system) = self.system() else {
+                return self.copied.clone().unwrap_or_default();
+            };
+            match system.get_text() {
+                Ok(text) => text,
+                Err(arboard::Error::ContentNotAvailable) => String::new(),
+                Err(_) => {
+                    // A lost connection (a restarted compositor): reconnect next time.
+                    self.system = None;
+                    String::new()
+                }
             }
         }
     }
@@ -150,6 +159,9 @@ impl Clipboard for SystemClipboard {
             return;
         }
         self.copied = Some(text.to_owned());
+        #[cfg(target_os = "ios")]
+        horizon_ios_platform::clipboard_set(text);
+        #[cfg(not(target_os = "ios"))]
         if let Some(system) = self.system()
             && system.set_text(text.to_owned()).is_err()
         {

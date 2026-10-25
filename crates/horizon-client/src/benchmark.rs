@@ -77,15 +77,29 @@ pub struct Setup {
 
 /// Starts the driver; the game quits when it is done, and the report's path is printed.
 pub fn start(requests: Sender<Request>, setup: Setup) {
+    let control = Control(requests.clone());
+    start_with_completion(requests, setup, move |_| {
+        let _ = control.call("quit");
+    });
+}
+
+/// Embedders keep their event loop alive and handle the result on its owner
+/// thread. The callback runs on the benchmark worker, never on the render loop.
+pub fn start_with_completion(
+    requests: Sender<Request>,
+    setup: Setup,
+    complete: impl FnOnce(Result<PathBuf, String>) + Send + 'static,
+) {
     thread::Builder::new()
         .name("horizon-benchmark".into())
         .spawn(move || {
             let control = Control(requests);
-            match run(&control, setup) {
+            let result = run(&control, setup);
+            match &result {
                 Ok(path) => println!("Horizon: benchmark report {}", path.display()),
                 Err(e) => eprintln!("Horizon: benchmark failed: {e}"),
             }
-            let _ = control.call("quit");
+            complete(result);
         })
         .expect("spawn the benchmark thread");
 }
@@ -412,6 +426,45 @@ impl RssSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_completion_reports_failure_without_quitting_the_host() {
+        let (requests, received) = std::sync::mpsc::channel();
+        let (result, completed) = std::sync::mpsc::channel();
+        start_with_completion(
+            requests,
+            Setup {
+                scenario: "not-a-scenario".into(),
+                started: Instant::now(),
+                app: App {
+                    name: "test".into(),
+                    version: "test".into(),
+                    commit: None,
+                    mods: Vec::new(),
+                },
+                simulation_distance: 12,
+                vsync: false,
+                fps_cap: None,
+                offscreen: true,
+                game_dir: PathBuf::new(),
+            },
+            move |value| result.send(value).unwrap(),
+        );
+        assert!(
+            completed
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err()
+                .contains("unknown scenario")
+        );
+        assert!(
+            matches!(
+                received.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the host must not receive quit"
+        );
+    }
 
     #[test]
     fn scenarios() {

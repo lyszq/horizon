@@ -498,7 +498,7 @@ impl Game<'_> {
             .renderer
             .as_ref()
             .map_or([1, 1], |r| [r.config.width, r.config.height]);
-        let b = HudBatch::new(size);
+        let b = self.ui_batch(size);
         let hit = CommandBlockScreen::buttons(b.width, b.height)
             .into_iter()
             .find(|(_, x, y, bw)| ui::hovered(self.cursor, *x, *y, *bw, 20.0))
@@ -571,6 +571,25 @@ impl Game<'_> {
         {
             s.command.insert_text(&allowed);
         }
+    }
+
+    /// Backspace from the native keyboard on the focused command box.
+    #[cfg(target_os = "ios")]
+    pub(super) fn command_block_mobile_backspace(&mut self) {
+        let ctrl = self.keys.contains(&KeyCode::ControlLeft);
+        let shift = self.keys.contains(&KeyCode::ShiftLeft);
+        if let Some(screen) = self.command_block_screen.as_mut() {
+            screen.command.key(KeyCode::Backspace, ctrl, shift);
+        }
+    }
+
+    /// Enter from the native keyboard: save and close like the screen's Done key.
+    #[cfg(target_os = "ios")]
+    pub(super) fn command_block_mobile_enter(&mut self) {
+        if let Some(screen) = self.command_block_screen.take() {
+            self.set_command_block(&screen);
+        }
+        self.close_command_block();
     }
     /// `ServerGamePacketListenerImpl.handleSetCommandBlock`.
     fn set_command_block(&mut self, s: &CommandBlockScreen) {
