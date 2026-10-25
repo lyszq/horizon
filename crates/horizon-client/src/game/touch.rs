@@ -69,16 +69,9 @@ impl Game<'_> {
             .and_then(|e| e.handle(id, phase, point));
         if let Some(command) = command {
             if command == EditorCommand::Save {
-                let editor = self.touch_editor.as_ref().unwrap();
-                let json = editor.draft.to_json()?;
-                std::fs::write("horizon-touch.json.tmp", &json)?;
-                std::fs::rename("horizon-touch.json.tmp", "horizon-touch.json")?;
-                self.touch.set_layout(editor.draft.clone());
-                if let Some(sandbox) = std::env::var_os("HOME") {
-                    let path =
-                        std::path::PathBuf::from(sandbox).join("Documents/horizon-touch.json");
-                    std::fs::write(path, json)?;
-                }
+                let layout = self.touch_editor.as_ref().unwrap().draft.clone();
+                save_touch_layout(&layout)?;
+                self.touch.set_layout(layout);
             }
             self.mobile_reset_pad();
             self.touch_editor = None;
@@ -131,6 +124,9 @@ impl Game<'_> {
             self.touch_editor_input(id, phase, x, y)?;
             return Ok(());
         }
+        // iPad menus keep touch when the gameplay overlay is hidden. Desktop
+        // platforms retain their existing opt-in touch path.
+        #[cfg(not(target_os = "ios"))]
         if !self.touch.enabled() {
             return Ok(());
         }
@@ -191,6 +187,18 @@ impl Game<'_> {
             editor.cancel_all();
         }
         for effect in self.touch.cancel_all() {
+            self.apply_touch_effect(event_loop, effect)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(super) fn set_touch_controls_visible(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        visible: bool,
+    ) -> horizon_client::Result<()> {
+        for effect in self.touch.set_enabled(visible) {
             self.apply_touch_effect(event_loop, effect)?;
         }
         Ok(())
@@ -424,6 +432,38 @@ impl Game<'_> {
         #[cfg(not(target_os = "ios"))]
         horizon_client::touch::draw_overlay(&self.touch, &self.gui.atlas, batch, self.cursor);
     }
+}
+
+#[cfg(target_os = "ios")]
+pub(super) fn load_saved_touch_layout() -> horizon_client::Result<horizon_client::touch::TouchLayout>
+{
+    match std::fs::read_to_string("horizon-touch.json") {
+        Ok(text) => horizon_client::touch::TouchLayout::from_json(&text).map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(horizon_client::touch::TouchLayout::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub(super) fn save_touch_layout(
+    layout: &horizon_client::touch::TouchLayout,
+) -> horizon_client::Result<()> {
+    let json = layout.to_json()?;
+    write_touch_layout_file(std::path::Path::new("horizon-touch.json"), &json)?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let documents = std::path::PathBuf::from(home).join("Documents/horizon-touch.json");
+        write_touch_layout_file(&documents, &json)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "ios")]
+fn write_touch_layout_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let stage = path.with_extension("json.tmp");
+    std::fs::write(&stage, contents)?;
+    std::fs::rename(stage, path)
 }
 
 #[cfg(target_os = "ios")]

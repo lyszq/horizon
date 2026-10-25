@@ -100,6 +100,14 @@ pub(super) struct Setup {
 
 pub(super) fn run(config: LaunchConfig) -> Result<()> {
     mobile_resources::recover_import_transaction(&config.paths.resources)?;
+    let touch_controls_visible = match super::touch::load_saved_touch_layout() {
+        Ok(layout) => layout.gameplay_controls_visible,
+        Err(error) => {
+            log::warn!("Touch controls preference: {error}");
+            false
+        }
+    };
+    platform::set_touch_controls_visible(touch_controls_visible);
     let mut setup = Setup {
         config, window: None, gpu: None, worker: None,
         message: "Import the resource ZIP prepared from your own Minecraft Java 26.3 installation. Your worlds stay on this iPad.".into(),
@@ -248,6 +256,23 @@ impl Setup {
         }
         for event in platform::poll_events() {
             match event {
+                Event::TouchControlsChanged(visible) => {
+                    match super::touch::load_saved_touch_layout() {
+                        Ok(mut layout) => {
+                            layout.gameplay_controls_visible = visible;
+                            if let Err(error) = super::touch::save_touch_layout(&layout) {
+                                self.message =
+                                    format!("Touch control setting could not be saved: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            self.message = format!(
+                                "Touch control setting could not be saved without changing the existing layout: {error}"
+                            );
+                        }
+                    }
+                    self.update_panel();
+                }
                 Event::ImportResources | Event::ImportWorld if self.worker.is_none() => {
                     let kind = if matches!(event, Event::ImportWorld) {
                         PickKind::World
@@ -739,6 +764,7 @@ impl Game<'_> {
         if self.mobile.suspended {
             return;
         }
+        platform::set_touch_controls_visible(self.touch.enabled());
         let finished = match self.mobile.benchmark.as_ref().map(|b| b.result.try_recv()) {
             Some(Ok(result)) => Some(result),
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
@@ -931,6 +957,15 @@ impl Game<'_> {
                 continue;
             }
             match event {
+                Event::TouchControlsChanged(visible) => {
+                    if let Err(error) = self.set_touch_controls_visible(event_loop, visible) {
+                        log::warn!("Touch controls update: {error}");
+                    }
+                    platform::set_touch_controls_visible(self.touch.enabled());
+                    if let Err(error) = super::touch::save_touch_layout(self.touch.layout()) {
+                        log::warn!("Touch controls preference save: {error}");
+                    }
+                }
                 Event::ShowSetup => {
                     if let Err(error) = self.cancel_touch_input(event_loop) {
                         log::warn!("Touch release before opening Files: {error}");

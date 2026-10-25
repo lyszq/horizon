@@ -207,6 +207,9 @@ fn chat_region() -> TouchRegion {
 #[serde(default)]
 pub struct TouchLayout {
     pub version: u8,
+    /// Whether gameplay touch controls are shown and accept gameplay input.
+    /// Menus remain touch-operable when this is false.
+    pub gameplay_controls_visible: bool,
     pub look_sensitivity: f32,
     pub stick_deadzone: f32,
     pub controls: Vec<TouchRegion>,
@@ -265,6 +268,7 @@ impl Default for TouchLayout {
         }
         Self {
             version: TOUCH_LAYOUT_VERSION,
+            gameplay_controls_visible: false,
             look_sensitivity: 0.45,
             stick_deadzone: STICK_DEADZONE,
             controls,
@@ -554,7 +558,7 @@ impl Default for TouchControls {
     fn default() -> Self {
         Self {
             layout: TouchLayout::default(),
-            enabled: cfg!(target_os = "ios"),
+            enabled: false,
             viewport: [1.0, 1.0],
             fingers: BTreeMap::new(),
             action_holds: HashMap::new(),
@@ -575,6 +579,7 @@ impl TouchControls {
 
     pub fn set_layout(&mut self, mut layout: TouchLayout) -> Vec<TouchEffect> {
         layout.sanitize();
+        self.enabled = layout.gameplay_controls_visible;
         let effects = self.cancel_all();
         self.layout = layout;
         effects
@@ -585,11 +590,13 @@ impl TouchControls {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) -> Vec<TouchEffect> {
-        self.enabled = enabled;
-        if !enabled {
-            return self.cancel_all();
+        if self.enabled == enabled {
+            self.layout.gameplay_controls_visible = enabled;
+            return Vec::new();
         }
-        Vec::new()
+        self.enabled = enabled;
+        self.layout.gameplay_controls_visible = enabled;
+        self.cancel_all()
     }
 
     /// The current analog stick vector, ready for `Keys::with_stick`.
@@ -813,6 +820,9 @@ impl TouchControls {
     }
 
     fn capture_gameplay(&self, point: [f32; 2]) -> Capture {
+        if !self.enabled {
+            return Capture::Ignored;
+        }
         // Action buttons override the larger look and stick hit areas.
         for region in &self.layout.controls {
             if region.control.action().is_some() && region.rect.contains(point) {
@@ -1155,7 +1165,9 @@ impl LayoutEditor {
                     match usize::MAX - index {
                         0 => return Some(EditorCommand::Save),
                         1 => {
+                            let gameplay_controls_visible = self.draft.gameplay_controls_visible;
                             self.draft = TouchLayout::default();
+                            self.draft.gameplay_controls_visible = gameplay_controls_visible;
                             self.fingers.clear();
                         }
                         2 => {
@@ -1285,6 +1297,19 @@ mod tests {
         assert_eq!(original, TouchLayout::default());
     }
 
+    #[test]
+    fn resetting_layout_preserves_gameplay_touch_visibility() {
+        let mut layout = TouchLayout::default();
+        layout.gameplay_controls_visible = true;
+        layout.look_sensitivity = 1.1;
+        let mut editor = LayoutEditor::new(&layout);
+        editor.handle(1, TouchPhase::Started, [0.3, 0.05]);
+
+        assert_eq!(editor.handle(1, TouchPhase::Ended, [0.3, 0.05]), None);
+        assert!(editor.draft.gameplay_controls_visible);
+        assert_eq!(editor.draft.controls, TouchLayout::default().controls);
+    }
+
     fn event(
         id: u64,
         phase: TouchPhase,
@@ -1299,6 +1324,204 @@ mod tests {
             viewport,
             mode,
         }
+    }
+
+    fn enabled_touch() -> TouchControls {
+        let mut touch = TouchControls::default();
+        touch.set_enabled(true);
+        touch
+    }
+
+    #[test]
+    fn gameplay_touch_visibility_round_trips_and_legacy_layouts_default_hidden() {
+        let mut layout = TouchLayout::default();
+        layout.gameplay_controls_visible = true;
+        layout.look_sensitivity = 0.8;
+        layout.controls[0].rect = NormalizedRect::new(0.06, 0.49, 0.29, 0.42);
+
+        let saved = layout.to_json().unwrap();
+        let restored = TouchLayout::from_json(&saved).unwrap();
+        assert!(restored.gameplay_controls_visible);
+        assert_eq!(restored.look_sensitivity, layout.look_sensitivity);
+        assert_eq!(restored.controls[0].rect, layout.controls[0].rect);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("gameplay_controls_visible");
+        let restored = TouchLayout::from_json(&legacy.to_string()).unwrap();
+        assert!(!restored.gameplay_controls_visible);
+        assert_eq!(restored.look_sensitivity, layout.look_sensitivity);
+        assert_eq!(restored.controls[0].rect, layout.controls[0].rect);
+    }
+
+    #[test]
+    fn hidden_gameplay_controls_leave_menu_taps_and_scroll_available() {
+        let mut touch = TouchControls::default();
+        assert!(!touch.enabled());
+        let viewport = [1024.0, 768.0];
+
+        for phase in [TouchPhase::Started, TouchPhase::Moved, TouchPhase::Ended] {
+            let effects = touch.handle(event(
+                1,
+                phase,
+                if phase == TouchPhase::Moved {
+                    [0.20, 0.68]
+                } else {
+                    [0.12, 0.68]
+                },
+                viewport,
+                TouchMode::Gameplay,
+            ));
+            assert!(effects.is_empty());
+        }
+        assert_eq!(touch.movement_vector(), [0.0, 0.0]);
+        assert!(!touch.action_active(TouchAction::Break));
+
+        assert!(
+            touch
+                .handle(event(
+                    2,
+                    TouchPhase::Started,
+                    [0.4, 0.5],
+                    viewport,
+                    TouchMode::Menu,
+                ))
+                .is_empty()
+        );
+        let click = touch.handle(event(
+            2,
+            TouchPhase::Ended,
+            [0.4, 0.5],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(click.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::MenuMouseButton {
+                button: TouchMouseButton::Left,
+                pressed: false,
+                cancelled: false
+            }
+        )));
+
+        touch.handle(event(
+            3,
+            TouchPhase::Started,
+            [0.4, 0.5],
+            viewport,
+            TouchMode::Menu,
+        ));
+        let scroll = touch.handle(event(
+            3,
+            TouchPhase::Moved,
+            [0.4, 0.7],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(
+            scroll
+                .iter()
+                .any(|effect| matches!(effect, TouchEffect::MenuScrolled(_)))
+        );
+    }
+
+    #[test]
+    fn hidden_mode_transition_cancels_menu_press_without_gameplay_input() {
+        let mut touch = TouchControls::default();
+        let viewport = [1024.0, 768.0];
+        touch.handle(event(
+            1,
+            TouchPhase::Started,
+            [0.4, 0.5],
+            viewport,
+            TouchMode::Menu,
+        ));
+        let pressed = touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [0.48, 0.5],
+            viewport,
+            TouchMode::Menu,
+        ));
+        assert!(pressed.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::MenuMouseButton {
+                button: TouchMouseButton::Left,
+                pressed: true,
+                cancelled: false
+            }
+        )));
+
+        let transition = touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [0.55, 0.5],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(transition.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::MenuMouseButton {
+                button: TouchMouseButton::Left,
+                pressed: false,
+                cancelled: true
+            }
+        )));
+        assert!(!transition.iter().any(|effect| matches!(
+            effect,
+            TouchEffect::LookDelta(_)
+                | TouchEffect::MovementChanged(_)
+                | TouchEffect::ActionChanged { pressed: true, .. }
+        )));
+        assert!(
+            touch
+                .handle(event(
+                    1,
+                    TouchPhase::Ended,
+                    [0.55, 0.5],
+                    viewport,
+                    TouchMode::Gameplay,
+                ))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn toggling_hidden_releases_held_touch_actions_and_stick() {
+        let mut touch = enabled_touch();
+        let viewport = [1024.0, 768.0];
+        touch.handle(event(
+            1,
+            TouchPhase::Started,
+            [0.12, 0.68],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        touch.handle(event(
+            1,
+            TouchPhase::Moved,
+            [0.20, 0.68],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        touch.handle(event(
+            2,
+            TouchPhase::Started,
+            [0.87, 0.60],
+            viewport,
+            TouchMode::Gameplay,
+        ));
+        assert!(touch.action_active(TouchAction::Break));
+        assert_ne!(touch.movement_vector(), [0.0, 0.0]);
+
+        let released = touch.set_enabled(false);
+        assert!(has_action(&released, TouchAction::Break, false));
+        assert!(released.contains(&TouchEffect::MovementChanged([0.0, 0.0])));
+        assert_eq!(touch.movement_vector(), [0.0, 0.0]);
+        assert!(!touch.layout().gameplay_controls_visible);
+        assert!(!touch.action_active(TouchAction::Break));
     }
 
     fn has_action(effects: &[TouchEffect], action: TouchAction, pressed: bool) -> bool {
@@ -1327,8 +1550,9 @@ mod tests {
             .find(|r| r.control == TouchControl::Chat)
             .unwrap()
             .rect;
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         touch.set_layout(restored);
+        touch.set_enabled(true);
         let effects = touch.handle(event(
             1,
             TouchPhase::Started,
@@ -1342,7 +1566,7 @@ mod tests {
 
     #[test]
     fn simultaneous_stick_look_and_action_keep_independent_capture() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1200.0, 800.0];
         touch.handle(event(
             1,
@@ -1415,7 +1639,7 @@ mod tests {
 
     #[test]
     fn cancellation_releases_actions_and_menu_pointer_without_leaks() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let press = touch.handle(event(
             10,
@@ -1451,7 +1675,7 @@ mod tests {
 
     #[test]
     fn overlapping_fingers_release_action_only_after_the_last_owner() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let first = touch.handle(event(
             1,
@@ -1493,7 +1717,8 @@ mod tests {
 
     #[test]
     fn normalized_layout_survives_resize_and_serde_round_trip() {
-        let layout = TouchLayout::default();
+        let mut layout = TouchLayout::default();
+        layout.gameplay_controls_visible = true;
         let json = layout.to_json().unwrap();
         let restored = TouchLayout::from_json(&json).unwrap();
         assert_eq!(layout, restored);
@@ -1508,7 +1733,7 @@ mod tests {
             break_rect.y + break_rect.height / 2.0,
         ];
         for viewport in [[2048.0, 1536.0], [1024.0, 768.0], [2732.0, 2048.0]] {
-            let mut touch = TouchControls::default();
+            let mut touch = enabled_touch();
             touch.set_layout(restored.clone());
             let effects = touch.handle(event(
                 1,
@@ -1585,7 +1810,7 @@ mod tests {
         let full_jump_center =
             safe.to_full_point([jump.x + jump.width / 2.0, jump.y + jump.height / 2.0]);
         let local_jump_center = safe.to_safe_point(full_jump_center);
-        let mut controls = TouchControls::default();
+        let mut controls = enabled_touch();
         controls.handle(event(
             1,
             TouchPhase::Started,
@@ -1610,7 +1835,7 @@ mod tests {
 
     #[test]
     fn menu_pointer_has_one_drag_owner_and_mode_change_cancels_it_safely() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1000.0, 700.0];
         let start = touch.handle(event(
             1,
@@ -1670,7 +1895,7 @@ mod tests {
 
     #[test]
     fn menu_tap_defers_left_press_until_release_and_cancellation_stays_inert() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let start = touch.handle(event(
             1,
@@ -1726,7 +1951,7 @@ mod tests {
 
     #[test]
     fn stationary_menu_long_press_is_right_click_and_cancels_without_commit() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         touch.handle(event(
             1,
@@ -1767,7 +1992,7 @@ mod tests {
 
     #[test]
     fn menu_drag_crossing_threshold_uses_left_button_and_keeps_capture() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1000.0, 700.0];
         touch.handle(event(
             1,
@@ -1804,7 +2029,7 @@ mod tests {
 
     #[test]
     fn joystick_uses_left_and_forward_axes_for_screen_directions() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1200.0, 800.0];
         let anchor = [0.16, 0.70];
         touch.handle(event(
@@ -1847,7 +2072,7 @@ mod tests {
 
     #[test]
     fn short_jump_tap_stays_held_until_one_player_tick() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let point = [0.88, 0.855];
         let press = touch.handle(event(
@@ -1883,7 +2108,7 @@ mod tests {
 
     #[test]
     fn held_jump_releases_after_sampled_tick_and_cancel_flushes_a_tap_latch() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let point = [0.88, 0.855];
         let press = event(1, TouchPhase::Started, point, viewport, TouchMode::Gameplay);
@@ -1905,7 +2130,7 @@ mod tests {
 
     #[test]
     fn pending_jump_tap_does_not_extend_a_new_hold_past_its_sampled_tick() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         let point = [0.88, 0.855];
 
@@ -1949,7 +2174,7 @@ mod tests {
 
     #[test]
     fn vertical_menu_swipe_scrolls_without_clicking() {
-        let mut touch = TouchControls::default();
+        let mut touch = enabled_touch();
         let viewport = [1024.0, 768.0];
         touch.handle(event(
             1,

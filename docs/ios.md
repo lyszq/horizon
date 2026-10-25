@@ -4,6 +4,11 @@ The port starts from upstream v0.2.48 (`7f995af677c6558e87b1ba4b035dfe12037dc9f2
 `ios/ipad` in the public `lyszq/horizon` fork, reviewed in draft PR #1. The first physical acceptance device is
 an iPad Air M2 on iPadOS 26.3. An unsigned IPA still needs the user's sideload signing before it can run there.
 
+The iOS branch now includes upstream through `21ff80eb8c6378b67c30930fb4f965ad5a4e55ab`, including
+v0.2.49–v0.2.54 and the subsequent mesh-model and world-generation fixes. This snapshot is merged as a
+separate commit so later upstream updates remain distinguishable from iOS changes. Minecraft resource
+schema 7 / 26.3 remains unchanged; existing validated imports do not need to be prepared again for this update.
+
 ## Private resource transfer and controls
 
 With Rust, Python and JDK 25 available on the PC, prepare a transfer from your own installed Java Edition 26.3:
@@ -22,6 +27,13 @@ Both routes produce `.local/ipad/horizon-resources-26.3.zip` and print its SHA-2
 separate from the IPA. On iPad, choose **Import resources** and select the ZIP in Files, then **Play**. The
 importer checks schema 7 / Minecraft 26.3, paths, expansion limits and each resource's size/hash before
 replacing the previous installation. Interrupted replacements are recovered on the next launch.
+
+**Gameplay touch controls: Hidden / Visible** switches the gameplay overlay on or off. It starts hidden,
+including when reading older saved layouts without this preference. Hidden mode leaves movement, look and
+gameplay actions to the controller or keyboard/mouse; menus and inventory still accept finger taps, swipes
+and long presses. Open the pause menu with the controller to reach the **Touch: Hidden / Visible** shortcut
+beside **Files**. The preference persists with the layout, and switching releases active touch inputs without
+releasing controller-held inputs.
 
 **Touch controls** opens the layout editor; the layout and look sensitivity persist in `horizon-touch.json`.
 Gameplay offers movement, look, jump, sneak, sprint, break/use, inventory, chat, drop, hotbar and pause. Menu swipes

@@ -13807,14 +13807,20 @@ mod tests {
 
 /// Load saved touch layout independently of vanilla's options file.
 fn mobile_touch_controls() -> horizon_client::touch::TouchControls {
-    let mut controls = horizon_client::touch::TouchControls::default();
+    let controls = horizon_client::touch::TouchControls::default();
     #[cfg(target_os = "ios")]
-    if let Ok(text) = std::fs::read_to_string("horizon-touch.json") {
-        if let Ok(layout) = horizon_client::touch::TouchLayout::from_json(&text) {
-            controls.set_layout(layout);
-        }
+    let mut controls = controls;
+    #[cfg(target_os = "ios")]
+    {
+        let layout = match touch::load_saved_touch_layout() {
+            Ok(layout) => layout,
+            Err(error) => {
+                log::warn!("Touch controls preference: {error}");
+                horizon_client::touch::TouchLayout::default()
+            }
+        };
+        controls.set_layout(layout);
     }
-    controls.set_enabled(cfg!(target_os = "ios"));
     controls
 }
 #[cfg(target_os = "ios")]

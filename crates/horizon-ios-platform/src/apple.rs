@@ -10,7 +10,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -137,6 +137,7 @@ pub enum Event {
     Cancelled,
     ImportResources,
     ImportWorld,
+    TouchControlsChanged(bool),
     EditTouch,
     Play,
     Benchmark,
@@ -154,10 +155,17 @@ pub enum Event {
     Error(String),
 }
 static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+static TOUCH_CONTROLS_VISIBLE: AtomicBool = AtomicBool::new(false);
 fn push(event: Event) {
     if let Ok(mut events) = EVENTS.lock() {
         events.push(event);
     }
+}
+pub fn set_touch_controls_visible(visible: bool) {
+    TOUCH_CONTROLS_VISIBLE.store(visible, Ordering::SeqCst);
+}
+fn touch_controls_visible() -> bool {
+    TOUCH_CONTROLS_VISIBLE.load(Ordering::SeqCst)
 }
 pub fn poll_events() -> Vec<Event> {
     // GameController does not feed GCMouse events through winit on UIKit. Bind
@@ -207,6 +215,31 @@ unsafe extern "C" fn import_world(_: Id, _: Sel, _: Id) {
 }
 unsafe extern "C" fn edit_touch(_: Id, _: Sel, _: Id) {
     push(Event::EditTouch);
+}
+unsafe fn set_touch_controls_title(button: Id, visible: bool) {
+    let title = if visible {
+        "Gameplay touch controls: Visible"
+    } else {
+        "Gameplay touch controls: Hidden"
+    };
+    msg!(button, "setTitle:forState:", (string(title) => Id, 0usize => usize) -> ());
+}
+unsafe fn set_touch_accessory_title(button: Id, visible: bool) {
+    let title = if visible {
+        "Touch: Visible"
+    } else {
+        "Touch: Hidden"
+    };
+    msg!(button, "setTitle:forState:", (string(title) => Id, 0usize => usize) -> ());
+}
+unsafe extern "C" fn toggle_touch_controls(_: Id, _: Sel, sender: Id) {
+    let visible = !TOUCH_CONTROLS_VISIBLE.fetch_xor(true, Ordering::SeqCst);
+    if msg!(sender, "tag", () -> isize) == TOUCH_ACCESSORY_TAG {
+        set_touch_accessory_title(sender, visible);
+    } else {
+        set_touch_controls_title(sender, visible);
+    }
+    push(Event::TouchControlsChanged(visible));
 }
 unsafe extern "C" fn play(_: Id, _: Sel, _: Id) {
     push(Event::Play);
@@ -285,6 +318,12 @@ unsafe fn delegate() -> Id {
             "v@:@",
             unsafe extern "C" fn(Id, Sel, Id)
         );
+        method!(
+            "toggleTouchControls:",
+            toggle_touch_controls,
+            "v@:@",
+            unsafe extern "C" fn(Id, Sel, Id)
+        );
         method!("play:", play, "v@:@", unsafe extern "C" fn(Id, Sel, Id));
         method!(
             "benchmark:",
@@ -347,6 +386,7 @@ pub fn open_picker(window: &impl HasWindowHandle, kind: PickKind) -> Result<(), 
 const SETUP_TAG: isize = 804320;
 const KEYBOARD_TAG: isize = 804321;
 const SETUP_ACCESSORY_TAG: isize = 804322;
+const TOUCH_ACCESSORY_TAG: isize = 804323;
 pub fn hide_setup(window: &impl HasWindowHandle) {
     if let Ok((view, _)) = handles(window) {
         unsafe {
@@ -361,6 +401,8 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
     unsafe {
         let accessory = msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id);
         msg!(accessory, "removeFromSuperview", () -> ());
+        let touch_accessory = msg!(view, "viewWithTag:", (TOUCH_ACCESSORY_TAG => isize) -> Id);
+        msg!(touch_accessory, "removeFromSuperview", () -> ());
         let bounds = msg!(view, "bounds", () -> Rect);
         // Stage Manager can make the window shorter than the setup controls.
         // Keep all actions reachable instead of placing them outside hit-testing.
@@ -384,9 +426,15 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
         msg!(label, "setAutoresizingMask:", (7usize => usize) -> ());
         msg!(panel, "addSubview:", (label => Id) -> ());
         msg!(label, "release", () -> ());
+        let touch_title = if touch_controls_visible() {
+            "Gameplay touch controls: Visible"
+        } else {
+            "Gameplay touch controls: Hidden"
+        };
         for (index, (title, action, enabled)) in [
             ("Import resources", "importResources:", true),
             ("Touch controls", "editTouch:", ready),
+            (touch_title, "toggleTouchControls:", true),
             ("Play", "play:", ready),
             ("Import world", "importWorld:", ready),
             ("Run benchmark", "benchmark:", ready),
@@ -416,23 +464,40 @@ pub fn show_setup(window: &impl HasWindowHandle, message: &str, ready: bool) -> 
 pub fn setup_accessory(window: &impl HasWindowHandle) -> Result<(), String> {
     let (view, _) = handles(window)?;
     unsafe {
-        if !msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id).is_null() {
+        let files = msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id);
+        let touch = msg!(view, "viewWithTag:", (TOUCH_ACCESSORY_TAG => isize) -> Id);
+        if !files.is_null() && !touch.is_null() {
             return Ok(());
         }
+        msg!(files, "removeFromSuperview", () -> ());
+        msg!(touch, "removeFromSuperview", () -> ());
         let insets = msg!(view, "safeAreaInsets", () -> Insets);
-        let button = msg!(class(c"UIButton"), "buttonWithType:", (1isize => isize) -> Id);
-        msg!(button, "setTag:", (SETUP_ACCESSORY_TAG => isize) -> ());
-        msg!(button, "setFrame:", (Rect {
+        let files = msg!(class(c"UIButton"), "buttonWithType:", (1isize => isize) -> Id);
+        msg!(files, "setTag:", (SETUP_ACCESSORY_TAG => isize) -> ());
+        msg!(files, "setFrame:", (Rect {
             origin: Point { x: insets.left + 14.0, y: insets.top + 14.0 },
             size: Size { width: 82.0, height: 44.0 },
         } => Rect) -> ());
         // Keep the shortcut anchored at the upper-left when the game view rotates.
-        msg!(button, "setAutoresizingMask:", (36usize => usize) -> ());
-        msg!(button, "setTitle:forState:", (string("Files") => Id, 0usize => usize) -> ());
-        msg!(button, "setTitleColor:forState:", (msg!(class(c"UIColor"), "whiteColor", () -> Id) => Id, 0usize => usize) -> ());
-        msg!(button, "setBackgroundColor:", (msg!(class(c"UIColor"), "colorWithWhite:alpha:", (0.08f64 => f64, 0.84f64 => f64) -> Id) => Id) -> ());
-        msg!(button, "addTarget:action:forControlEvents:", (delegate() => Id, sel_registerName(c"showSetup:".as_ptr()) => Sel, 1usize << 6 => usize) -> ());
-        msg!(view, "addSubview:", (button => Id) -> ());
+        msg!(files, "setAutoresizingMask:", (36usize => usize) -> ());
+        msg!(files, "setTitle:forState:", (string("Files") => Id, 0usize => usize) -> ());
+        msg!(files, "setTitleColor:forState:", (msg!(class(c"UIColor"), "whiteColor", () -> Id) => Id, 0usize => usize) -> ());
+        msg!(files, "setBackgroundColor:", (msg!(class(c"UIColor"), "colorWithWhite:alpha:", (0.08f64 => f64, 0.84f64 => f64) -> Id) => Id) -> ());
+        msg!(files, "addTarget:action:forControlEvents:", (delegate() => Id, sel_registerName(c"showSetup:".as_ptr()) => Sel, 1usize << 6 => usize) -> ());
+        msg!(view, "addSubview:", (files => Id) -> ());
+
+        let touch = msg!(class(c"UIButton"), "buttonWithType:", (1isize => isize) -> Id);
+        msg!(touch, "setTag:", (TOUCH_ACCESSORY_TAG => isize) -> ());
+        msg!(touch, "setFrame:", (Rect {
+            origin: Point { x: insets.left + 104.0, y: insets.top + 14.0 },
+            size: Size { width: 152.0, height: 44.0 },
+        } => Rect) -> ());
+        msg!(touch, "setAutoresizingMask:", (36usize => usize) -> ());
+        set_touch_accessory_title(touch, touch_controls_visible());
+        msg!(touch, "setTitleColor:forState:", (msg!(class(c"UIColor"), "whiteColor", () -> Id) => Id, 0usize => usize) -> ());
+        msg!(touch, "setBackgroundColor:", (msg!(class(c"UIColor"), "colorWithWhite:alpha:", (0.08f64 => f64, 0.84f64 => f64) -> Id) => Id) -> ());
+        msg!(touch, "addTarget:action:forControlEvents:", (delegate() => Id, sel_registerName(c"toggleTouchControls:".as_ptr()) => Sel, 1usize << 6 => usize) -> ());
+        msg!(view, "addSubview:", (touch => Id) -> ());
     }
     Ok(())
 }
@@ -443,6 +508,8 @@ pub fn hide_accessory(window: &impl HasWindowHandle) {
         unsafe {
             let accessory = msg!(view, "viewWithTag:", (SETUP_ACCESSORY_TAG => isize) -> Id);
             msg!(accessory, "removeFromSuperview", () -> ());
+            let touch = msg!(view, "viewWithTag:", (TOUCH_ACCESSORY_TAG => isize) -> Id);
+            msg!(touch, "removeFromSuperview", () -> ());
         }
     }
 }

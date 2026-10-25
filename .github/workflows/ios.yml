@@ -15,7 +15,7 @@ concurrency:
 env:
   HORIZON_TELEMETRY_URL: "off"
   HORIZON_COMMIT: ${{ github.sha }}
-  IOS_APP_VERSION: "0.2.48"
+  IOS_APP_VERSION: "0.2.54"
   IOS_MINIMUM_OS: "26.0"
   CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
 
@@ -79,6 +79,9 @@ jobs:
 
       - name: Run asset-free Rust tests
         run: cargo test -p horizon-client --lib --bin horizon-client --locked
+
+      - name: Verify the merged upstream libraries
+        run: cargo test --locked -p horizon-core -p horizon-world -p horizon-protocol -p horizon-assets -p horizon-bench -p horizon-shaders -p horizon-mods -p horizon-port-pack -p horizon-prepare --lib --features horizon-mods/index
 
       - name: Test iOS package builder
         run: python3 -m unittest discover -s tests -p 'test_package_ios.py' -v

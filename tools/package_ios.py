@@ -289,7 +289,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--icon", type=Path, default=ICON_SOURCE, help="original Horizon PNG icon")
     result.add_argument("--output-dir", type=Path, required=True)
     result.add_argument("--commit", required=True)
-    result.add_argument("--version", default="0.2.48")
+    result.add_argument("--version", default="0.2.54")
     result.add_argument("--build-number", default=os.environ.get("GITHUB_RUN_NUMBER", "1"))
     result.add_argument("--minimum-os", default=MINIMUM_IOS)
     result.add_argument("--sdk-version", required=True)
