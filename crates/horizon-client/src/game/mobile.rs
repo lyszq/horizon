@@ -431,7 +431,14 @@ impl BootstrapGpu {
             return Err("A Metal adapter is required".into());
         }
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Horizon iPad bootstrap device"),
+                // Match the game's open_device: Metal can expose fewer shader
+                // varyings than wgpu's generic defaults even on a valid adapter.
+                // The bootstrap only clears/presents; it needs no shader stages.
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
             .await?;
         let size = window.inner_size();
         let mut config = surface

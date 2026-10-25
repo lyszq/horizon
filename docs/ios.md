@@ -42,10 +42,12 @@ current graphics settings. Benchmark operation temporarily removes the frame cap
 ## Public Apple build
 
 The public iOS workflow builds the existing `horizon-client` Rust executable for physical arm64 iOS and the Apple
-Silicon simulator. It installs Rust 1.99.1 and both Apple Silicon iOS targets, uses the `iphoneos` and
-`iphonesimulator` SDKs selected by Xcode on the standard `macos-26` GitHub-hosted runner, and sets the minimum OS to
-iOS 26.0. Each package records the exact Rust, Xcode, SDK, and commit versions in `build-metadata.json` so the
-resolved build inputs can be checked against the first green run and any later toolchain changes.
+Silicon simulator. It pins Rust 1.99.1, Xcode 26.6 (17F113) at
+`/Applications/Xcode_26.6.app/Contents/Developer`, and the iPhoneOS/Simulator 26.5 SDKs on the standard `macos-26`
+GitHub-hosted runner. These inputs compiled both Apple targets; runtime acceptance is tracked separately.
+The minimum OS remains iOS 26.0. A preflight rejects a runner toolchain mismatch rather than silently selecting
+another SDK. Each package records the exact Rust, Xcode, SDK, and commit versions in `build-metadata.json`.
+Always-run simulator diagnostics preserve the app report, logs and screenshot even if the launch test fails.
 
 The app bundle identifier is `dev.lyszq.horizon`. The package builder takes only Cargo's `horizon-client` Mach-O
 and the original Horizon icon under `packaging/icons/`; it never reads `.local/`, Minecraft assets, saves, or world

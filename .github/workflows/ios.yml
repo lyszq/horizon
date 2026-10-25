@@ -99,6 +99,8 @@ jobs:
     # Public GitHub-hosted Apple Silicon runner only; no project runner labels or signing secrets.
     runs-on: macos-26
     timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     defaults:
       run:
         shell: bash
@@ -136,6 +138,11 @@ jobs:
           xcode-select -p | tee "$RUNNER_TEMP/horizon-ios/xcode-developer-dir.txt"
           xcrun --sdk iphoneos --show-sdk-version | tee "$RUNNER_TEMP/horizon-ios/iphoneos-sdk-version.txt"
           xcrun --sdk iphonesimulator --show-sdk-version | tee "$RUNNER_TEMP/horizon-ios/iphonesimulator-sdk-version.txt"
+          grep -Fxq 'Xcode 26.6' "$RUNNER_TEMP/horizon-ios/xcode-version.txt"
+          grep -Fxq 'Build version 17F113' "$RUNNER_TEMP/horizon-ios/xcode-version.txt"
+          grep -Fxq "$DEVELOPER_DIR" "$RUNNER_TEMP/horizon-ios/xcode-developer-dir.txt"
+          test "$(cat "$RUNNER_TEMP/horizon-ios/iphoneos-sdk-version.txt")" = "26.5"
+          test "$(cat "$RUNNER_TEMP/horizon-ios/iphonesimulator-sdk-version.txt")" = "26.5"
 
       - name: Build device arm64 executable and dSYM
         run: |
@@ -193,6 +200,7 @@ jobs:
           PY
           )"
           echo "Using iPad simulator $udid"
+          printf '%s\n' "$udid" > "$RUNNER_TEMP/horizon-ios/evidence/simulator-udid.txt"
           xcrun simctl boot "$udid" 2>/dev/null || true
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl install "$udid" "$RUNNER_TEMP/horizon-ios/simulator/Horizon.app"
@@ -222,6 +230,50 @@ jobs:
           xcrun simctl io "$udid" screenshot "$RUNNER_TEMP/horizon-ios/evidence/horizon-ios-smoke.png"
           test -s "$RUNNER_TEMP/horizon-ios/evidence/horizon-ios-smoke.png"
           xcrun simctl spawn "$udid" log show --last 2m --style compact --predicate 'process == "Horizon"' > "$RUNNER_TEMP/horizon-ios/evidence/simulator.log" || true
+
+      - name: Collect simulator failure diagnostics
+        if: always()
+        run: |
+          set +e
+          diagnostics="$RUNNER_TEMP/horizon-ios/evidence/diagnostics"
+          mkdir -p "$diagnostics"
+          evidence="$RUNNER_TEMP/horizon-ios/evidence"
+          for name in launch.log simulator.log horizon-ios-smoke.json horizon-ios-smoke.png sim-devices.json sim-runtimes.json simulator-udid.txt; do
+            if [[ -s "$evidence/$name" ]]; then
+              cp -p "$evidence/$name" "$diagnostics/$name"
+            fi
+          done
+
+          udid_file="$evidence/simulator-udid.txt"
+          if [[ -s "$udid_file" ]]; then
+            udid="$(cat "$udid_file")"
+            xcrun simctl io "$udid" screenshot "$diagnostics/simulator-final.png" >/dev/null 2>&1
+            xcrun simctl spawn "$udid" log show --last 10m --style compact --predicate 'process == "Horizon"' > "$diagnostics/simulator-last-10m.log" 2>&1
+            container="$(xcrun simctl get_app_container "$udid" dev.lyszq.horizon data 2>/dev/null)"
+            if [[ -n "$container" && -d "$container" ]]; then
+              for relative in \
+                "Documents/horizon-ios-smoke.json" \
+                "Library/Application Support/Horizon/logs" \
+                "Library/Application Support/Horizon/crash-reports"; do
+                source="$container/$relative"
+                if [[ -f "$source" ]]; then
+                  mkdir -p "$diagnostics/app-container/$(dirname "$relative")"
+                  cp -p "$source" "$diagnostics/app-container/$relative"
+                elif [[ -d "$source" ]]; then
+                  mkdir -p "$diagnostics/app-container/$(dirname "$relative")"
+                  cp -Rp "$source" "$diagnostics/app-container/$(dirname "$relative")/"
+                fi
+              done
+            fi
+          fi
+
+          reports="$HOME/Library/Logs/DiagnosticReports"
+          if [[ -d "$reports" ]]; then
+            find "$reports" -maxdepth 1 -type f \
+              \( -iname 'Horizon*.ips' -o -iname 'Horizon*.crash' \) \
+              -exec cp -p {} "$diagnostics/" \; 2>/dev/null
+          fi
+          exit 0
 
       - name: Upload packages, symbols, simulator report, and screenshot
         if: always()
